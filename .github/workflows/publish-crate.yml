@@ -7,6 +7,8 @@ on:
 
 jobs:
   publish:
+    # The crate is owned and released by the canonical repository.
+    if: github.repository == 'datagutt/moblink-rust'
     runs-on: ubuntu-latest
 
     steps:
