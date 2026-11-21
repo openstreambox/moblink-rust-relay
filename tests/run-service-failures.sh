@@ -42,20 +42,8 @@ print(executables[0])
 
 sudo -n modprobe veth
 sudo -n modprobe sch_netem
-# The inner user namespace cannot traverse arbitrary caller-owned paths.
-# Stage only the test executable and release artifacts in a disposable path.
-stage=$(sudo -n mktemp -d /run/moblink-tests.XXXXXX)
-trap 'sudo -n rm -r -- "$stage"' EXIT
-sudo -n install -m 0755 "$test_bin" "$stage/service_failures"
-sudo -n install -m 0755 "$artifact_dir"/moblink-*-"$target" "$stage/"
-sudo -n install -m 0644 "$artifact_dir/SHA256SUMS-$target" "$stage/"
-sudo -n sh -ec 'cd "$1"; sha256sum --check "$2"' sh "$stage" "SHA256SUMS-$target"
-for test_name in "${test_names[@]}"; do
-  sudo -n unshare --map-root-user --net --fork --kill-child -- \
-    env MOBLINK_TEST_NETNS=1 MOBLINK_TEST_SYSTEMD=1 \
-      TMPDIR="$stage" MOBLINK_TEST_LOG_DIR="$stage" \
-      MOBLINK_RELAY_BIN="$stage/moblink-relay-$target" \
-      MOBLINK_RELAY_SERVICE_BIN="$stage/moblink-relay-service-$target" \
-    sh -ec 'ip link set lo up; exec "$@"' sh \
-      "$stage/service_failures" --include-ignored --test-threads=1 --nocapture --exact "$test_name"
-done
+# Staging, the process group, runtime units and diagnostics share one
+# privileged owner with cleanup even if an individual harness is killed.
+log_dir="$PWD/target/tmp"
+mkdir -p "$log_dir"
+exec sudo -n python3 tests/run-service-cases.py "$test_bin" "$artifact_dir" "$log_dir" "${test_names[@]}"

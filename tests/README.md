@@ -19,7 +19,8 @@ runner removes the unit and its state at the end of the test.
 
 Use a disposable x86_64 Linux VM with a systemd 255 or newer system manager,
 `iproute2`, `util-linux`, Python 3, the veth and sch_netem kernel modules,
-and noninteractive sudo. Use the Rust toolchain named in the release workflow.
+an executable `/run` mount, and noninteractive sudo. Use the Rust toolchain
+named in the release workflow.
 Extract its `Cargo.lock` artifact to the repository root and the corresponding
 `moblink-x86_64-unknown-linux-musl` artifact to `dist/`, including its
 `SHA256SUMS-x86_64-unknown-linux-musl`. From the repository root run:
@@ -30,9 +31,12 @@ RUSTUP_TOOLCHAIN=nightly-2026-05-25 bash tests/run-service-failures.sh
 
 The launcher builds the test harness as the caller, stages and verifies the
 release artifacts, then passes the verified service and standalone relay to the
-harness as `MOBLINK_RELAY_SERVICE_BIN` and `MOBLINK_RELAY_BIN`. Failed unit tests
-print the test unit's journal. Plain `cargo test` skips the systemd scenarios
-because they need the launcher and its release artifacts.
+harness as `MOBLINK_RELAY_SERVICE_BIN` and `MOBLINK_RELAY_BIN`. The launcher
+owns the runtime unit names and the test process group. It stops and removes
+test units after interruption, kills and reaps leftover helpers, and preserves
+the unit journal and legacy relay log under `target/tmp/` for CI upload.
+Plain `cargo test` skips the systemd scenarios because they need the launcher
+and its release artifacts.
 
 To rerun just the discovery retirement case that also runs in CI:
 
