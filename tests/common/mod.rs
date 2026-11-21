@@ -14,17 +14,17 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use futures_util::{SinkExt, StreamExt};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, oneshot, watch};
-use tokio::time::{sleep, timeout, Instant};
+use tokio::time::{Instant, sleep, timeout};
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{accept_async, WebSocketStream};
+use tokio_tungstenite::{WebSocketStream, accept_async};
 use uuid::Uuid;
 
 pub const PASSWORD: &str = "ci-failure-tests";
@@ -48,7 +48,9 @@ impl RelayProcess {
     pub fn spawn(name: &str, id: Uuid, streamer: SocketAddr, bind_address: &str) -> Self {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let log = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        let log = std::env::var_os("MOBLINK_TEST_LOG_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_TARGET_TMPDIR")))
             .join(format!("relay-{name}-{}-{n}.log", std::process::id()));
         let file = File::create(&log).expect("create relay log");
         let child = Command::new(relay_binary())
@@ -238,6 +240,10 @@ impl FakeMoblin {
 
     pub async fn bind(addr: SocketAddr) -> Self {
         let listener = TcpListener::bind(addr).await.expect("bind fake streamer");
+        Self::from_listener(listener)
+    }
+
+    pub fn from_listener(listener: TcpListener) -> Self {
         let addr = listener.local_addr().unwrap();
         let (session_tx, sessions) = mpsc::channel(16);
         let (rejected_tx, rejected) = watch::channel(0);
@@ -465,7 +471,7 @@ async fn session_task(
 /// Echoes every datagram back to its sender and counts what it received.
 pub struct EchoReceiver {
     pub addr: SocketAddr,
-    received: watch::Receiver<Vec<Vec<u8>>>,
+    received: watch::Receiver<Vec<(Vec<u8>, SocketAddr)>>,
     silent: watch::Sender<bool>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -473,6 +479,10 @@ pub struct EchoReceiver {
 impl EchoReceiver {
     pub async fn bind(addr: &str) -> Self {
         let socket = UdpSocket::bind(addr).await.expect("bind receiver");
+        Self::from_socket(socket)
+    }
+
+    pub fn from_socket(socket: UdpSocket) -> Self {
         let addr = socket.local_addr().unwrap();
         let (received_tx, received) = watch::channel(Vec::new());
         let (silent, silent_rx) = watch::channel(false);
@@ -483,7 +493,7 @@ impl EchoReceiver {
                     // ICMP errors from earlier replies surface here; keep going.
                     continue;
                 };
-                received_tx.send_modify(|all| all.push(buf[..size].to_vec()));
+                received_tx.send_modify(|all| all.push((buf[..size].to_vec(), from)));
                 if !*silent_rx.borrow() {
                     socket.send_to(&buf[..size], from).await.ok();
                 }
@@ -502,7 +512,11 @@ impl EchoReceiver {
     }
 
     pub fn has_received(&self, payload: &[u8]) -> bool {
-        self.received.borrow().iter().any(|p| p == payload)
+        self.received.borrow().iter().any(|(p, _)| p == payload)
+    }
+
+    pub fn received(&self) -> Vec<(Vec<u8>, SocketAddr)> {
+        self.received.borrow().clone()
     }
 
     /// Keeps receiving but stops answering, like an ingest that went away.
@@ -536,13 +550,13 @@ impl StreamerUdp {
     /// Sends `payload` to the relay and waits for the same bytes to come back
     /// through the receiver's echo.
     pub async fn round_trip(&self, relay_port: u16, payload: &[u8]) -> bool {
-        self.drain();
-        if self
-            .socket
-            .send_to(payload, ("127.0.0.1", relay_port))
+        self.round_trip_to(([127, 0, 0, 1], relay_port).into(), payload)
             .await
-            .is_err()
-        {
+    }
+
+    pub async fn round_trip_to(&self, relay: SocketAddr, payload: &[u8]) -> bool {
+        self.drain();
+        if self.socket.send_to(payload, relay).await.is_err() {
             return false;
         }
         let mut buf = [0u8; 2048];
@@ -584,15 +598,28 @@ impl StreamerUdp {
         receivers: &[&EchoReceiver],
         window: Duration,
     ) {
+        self.assert_quiet_on(
+            ([127, 0, 0, 1], relay_port).into(),
+            payload,
+            receivers,
+            window,
+        )
+        .await;
+    }
+
+    pub async fn assert_quiet_on(
+        &self,
+        relay: SocketAddr,
+        payload: &[u8],
+        receivers: &[&EchoReceiver],
+        window: Duration,
+    ) {
         self.drain();
         let probes: Vec<Vec<u8>> = (1..=3)
             .map(|i| [payload, format!(" #{i}").as_bytes()].concat())
             .collect();
         for probe in &probes {
-            self.socket
-                .send_to(probe, ("127.0.0.1", relay_port))
-                .await
-                .expect("send probe");
+            self.socket.send_to(probe, relay).await.expect("send probe");
             sleep(Duration::from_millis(50)).await;
         }
         let mut buf = [0u8; 2048];
@@ -608,12 +635,12 @@ impl StreamerUdp {
         })
         .await
         .is_ok();
-        assert!(!echoed, "retired port {relay_port} still answered");
+        assert!(!echoed, "retired tunnel {relay} still answered");
         for probe in &probes {
             for receiver in receivers {
                 assert!(
                     !receiver.has_received(probe),
-                    "retired port {relay_port} still forwarded to a receiver"
+                    "retired tunnel {relay} still forwarded to a receiver"
                 );
             }
         }

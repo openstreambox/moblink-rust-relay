@@ -164,6 +164,9 @@ jobs:
           MOBLINK_TEST_NETNS=1 unshare --map-root-user --net -- \
             sh -c "ip link set lo up && exec cargo +$TOOLCHAIN test --locked --offline --test netns_failures -- --ignored"
 
+      - name: Relay service, netem, multicast discovery, and rollback
+        run: RUSTUP_TOOLCHAIN="$TOOLCHAIN" bash tests/run-service-failures.sh
+
       - name: Upload relay logs
         if: failure()
         uses: actions/upload-artifact@v7
