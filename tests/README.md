@@ -1,6 +1,6 @@
 # Relay service failure tests
 
-The release-binary job runs four service scenarios on its Ubuntu GitHub runner.
+The release-binary job runs five service scenarios on its Ubuntu GitHub runner.
 Each scenario gets a fresh network namespace owned by a new user namespace and
 a separate peer namespace. The host systemd starts a uniquely named runtime
 system unit using the packaged BELABOX unit and [a test drop-in](fixtures/box.conf).
@@ -12,6 +12,7 @@ runner removes the unit and its state at the end of the test.
 | Two uplinks and netem | Separate egress receivers see tagged UDP and the expected source address. Netem on both ends of one uplink adds delay, loss and reordering. The independent uplink keeps carrying traffic during the blackhole. The impaired path recovers after blackhole, carrier cut, address removal and renumbering, and veth deletion and replug. Retired ports stay quiet, the interface UUID survives, and the service PID stays the same. |
 | Systemd crash and rate limit | SIGKILL closes the original session and leaves its port quiet. The restarted service reauthenticates with a fresh challenge and the same UUID, publishes authenticated status under the new PID, and carries UDP. Failed pre-start checks exhaust the retry budget. After the input is restored, a start is refused until `reset-failed`, then fresh traffic succeeds. |
 | Multicast DNS | The publisher and relay are on opposite veth ends. The relay discovers a DNS-SD advertisement, then carries traffic after the same instance is withdrawn and reannounced with a new IPv4 address. Distinct instances with the same display name each carry UDP, and an advertisement pointing at the relay itself is ignored. Fixed-URL mode carries traffic while bypassing the multicast advertisements. |
+| Multicast DNS retirement | DNS-SD withdrawal closes the active relay and clears runtime status. The old listener stays available for longer than a retry interval and accepts no reconnect. Reannouncing the same instance starts one relay at the new address. |
 | Supervisor rollback | The activation record gates the service and a legacy-owner fixture that launches the standalone relay. The test checks the disabled state, shuts down each old owner and checks that its last tunnel forwards nothing before activating the other owner, and checks traffic and legacy UUID restoration after rollback. |
 
 ## Run locally
@@ -30,11 +31,10 @@ RUSTUP_TOOLCHAIN=nightly-2026-05-25 bash tests/run-service-failures.sh
 The launcher builds the test harness as the caller, stages and verifies the
 release artifacts, then passes the verified service and standalone relay to the
 harness as `MOBLINK_RELAY_SERVICE_BIN` and `MOBLINK_RELAY_BIN`. Failed unit tests
-print the test unit's journal. Plain `cargo test` leaves these cases ignored.
+print the test unit's journal. Plain `cargo test` skips the systemd scenarios
+because they need the launcher and its release artifacts.
 
-Strict discovery retirement is a local qualification case expected to fail on
-the current release. It requires the old address to stop taking reconnects and
-the service status to converge on one streamer and one relay:
+To rerun just the discovery retirement case that also runs in CI:
 
 ```sh
 RUSTUP_TOOLCHAIN=nightly-2026-05-25 bash tests/run-service-failures.sh --strict-mdns

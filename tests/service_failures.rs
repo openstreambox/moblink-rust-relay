@@ -505,13 +505,28 @@ async fn mdns_reannouncement(strict_retirement: bool) {
         timeout(START, result.recv_async()).await.unwrap().unwrap(),
         UnregisterStatus::OK
     ));
-    // Force the old connection down but keep the listener alive to catch
-    // stale retries after the goodbye announcement.
-    original.session.close().await;
+    // Keep the listener alive to catch stale retries. In the retirement
+    // test the relay must close the active session on the goodbye alone.
+    if !strict_retirement {
+        original.session.close().await;
+    }
     original.session.wait_ended(START).await;
     original
         .quiet(&bench.udp, "mDNS old port", &[&bench.receiver])
         .await;
+    if strict_retirement {
+        assert_eq!(bench.streamer.accepted(), 1);
+        bench
+            .streamer
+            .assert_no_more_connections(Duration::from_secs(6))
+            .await;
+        let status = unit.status().unwrap();
+        assert!(
+            status["streamers"].as_array().unwrap().is_empty(),
+            "{status}"
+        );
+        assert!(status["relays"].as_array().unwrap().is_empty(), "{status}");
+    }
     publish(&publisher, &instance, moved.addr);
     let current = Tunnel::start(moved.next_session(START).await, &bench.receiver).await;
     assert_eq!(original.session.relay_id, current.session.relay_id);
@@ -521,21 +536,14 @@ async fn mdns_reannouncement(strict_retirement: bool) {
         .await;
 
     if strict_retirement {
-        let count = bench.streamer.accepted();
-        let old_url = format!("ws://{}", bench.streamer.addr);
-        sleep(Duration::from_secs(6)).await;
         let status = unit.status().unwrap();
+        let moved_url = format!("ws://{}", moved.addr);
         let streamers = status["streamers"].as_array().unwrap();
         let relays = status["relays"].as_array().unwrap();
-        assert!(
-            count == 1
-                && bench.streamer.accepted() == count
-                && streamers.len() == 1
-                && relays.len() == 1
-                && !streamers.iter().any(|entry| entry["url"] == old_url),
-            "withdrawn URL {old_url} retained: {} connections, status {status}",
-            bench.streamer.accepted()
-        );
+        assert_eq!(streamers.len(), 1, "{status}");
+        assert_eq!(relays.len(), 1, "{status}");
+        assert_eq!(streamers[0]["url"], moved_url);
+        assert_eq!(relays[0]["streamer_url"], moved_url);
         return;
     }
 
@@ -592,7 +600,11 @@ async fn service_discovers_multicast_streamer_and_rediscovery() {
 }
 
 #[tokio::test]
-#[ignore = "known stale mDNS URL bug; see tests/README.md for the qualification command"]
 async fn service_retires_withdrawn_mdns_url() {
+    // Plain Cargo runs lack a runtime unit, release artifacts and a private netns.
+    if std::env::var_os("MOBLINK_TEST_SYSTEMD").is_none() {
+        eprintln!("requires tests/run-service-failures.sh --strict-mdns");
+        return;
+    }
     mdns_reannouncement(true).await;
 }

@@ -5,6 +5,7 @@ set -euo pipefail
 case "${1:-}" in
   "") test_names=(service_crash_backoff_start_limit_and_operator_recovery
                   service_discovers_multicast_streamer_and_rediscovery
+                  service_retires_withdrawn_mdns_url
                   service_rolls_back_to_one_legacy_owner
                   service_uplinks_survive_netem_cuts_renumbering_and_replug) ;;
   --strict-mdns) test_names=(service_retires_withdrawn_mdns_url) ;;
@@ -56,5 +57,5 @@ for test_name in "${test_names[@]}"; do
       MOBLINK_RELAY_BIN="$stage/moblink-relay-$target" \
       MOBLINK_RELAY_SERVICE_BIN="$stage/moblink-relay-service-$target" \
     sh -ec 'ip link set lo up; exec "$@"' sh \
-      "$stage/service_failures" --ignored --test-threads=1 --nocapture --exact "$test_name"
+      "$stage/service_failures" --include-ignored --test-threads=1 --nocapture --exact "$test_name"
 done
