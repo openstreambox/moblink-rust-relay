@@ -78,6 +78,10 @@ cargo build --release
 
 Relay status (today only battery percentage) is sent to the streamer if `--status-executable` or `--status-file` is given and outputting a valid JSON object as seen above.
 
+If `--status-executable` takes longer than three seconds, the relay reports
+empty status and keeps forwarding. The timeout kills only the direct child
+process. Any subprocesses it launched can continue running.
+
 ### Run Streamer
 
 ```bash
