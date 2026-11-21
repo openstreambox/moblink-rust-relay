@@ -179,7 +179,14 @@ async fn wait_for_working_tunnel(
             attempt += 1;
             let payload = format!("probe {attempt}");
             if !session.is_closed() && udp.round_trip(*port, payload.as_bytes()).await {
-                return started.elapsed();
+                // The echo may arrive after the deadline that let the probe
+                // start, so check it again.
+                let recovered = started.elapsed();
+                assert!(
+                    recovered < limit,
+                    "traffic only resumed after {recovered:?}, limit {limit:?}"
+                );
+                return recovered;
             }
         }
         sleep(Duration::from_millis(250)).await;
