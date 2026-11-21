@@ -575,12 +575,13 @@ impl StreamerUdp {
     }
 
     /// Sends three tagged probes to a port that should no longer forward and
-    /// checks that none reaches `receiver` or comes back within `window`.
+    /// checks that none reaches any of `receivers` or comes back within
+    /// `window`.
     pub async fn assert_quiet(
         &self,
         relay_port: u16,
         payload: &[u8],
-        receiver: &EchoReceiver,
+        receivers: &[&EchoReceiver],
         window: Duration,
     ) {
         self.drain();
@@ -609,10 +610,12 @@ impl StreamerUdp {
         .is_ok();
         assert!(!echoed, "retired port {relay_port} still answered");
         for probe in &probes {
-            assert!(
-                !receiver.has_received(probe),
-                "retired port {relay_port} still forwarded to the receiver"
-            );
+            for receiver in receivers {
+                assert!(
+                    !receiver.has_received(probe),
+                    "retired port {relay_port} still forwarded to a receiver"
+                );
+            }
         }
     }
 
