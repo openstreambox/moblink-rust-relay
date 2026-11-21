@@ -68,7 +68,10 @@ jobs:
           case ${{ matrix.target }} in
             x86_64-unknown-linux-musl) sudo apt-get -y update ; sudo apt-get -y install musl-tools ;;
             aarch64-unknown-linux-musl) sudo apt-get -y update ; sudo apt-get -y install gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu musl-tools ;;
-            mips-unknown-linux-musl) sudo apt-get -y update ; sudo apt-get -y install gcc-mips-linux-gnu binutils-mips-linux-gnu musl-tools ;;
+            # cross builds inside its own image and the mips binaries are not
+            # stripped, so no host tools are needed. Newer Ubuntu runner images
+            # no longer ship gcc-mips-linux-gnu.
+            mips-unknown-linux-musl) ;;
           esac
 
       - name: Install Rust toolchain
