@@ -31,9 +31,12 @@ RUSTUP_TOOLCHAIN=nightly-2026-05-25 bash tests/run-service-failures.sh
 The launcher builds the test harness as the caller, stages and verifies the
 release artifacts, then passes the verified service and standalone relay to the
 harness as `MOBLINK_RELAY_SERVICE_BIN` and `MOBLINK_RELAY_BIN`. The launcher
-owns the runtime unit names and the test process group. It stops and removes
-test units after interruption, kills and reaps leftover helpers, and preserves
-the unit journal and legacy relay log under `target/tmp/` for CI upload.
+owns the runtime unit names and the test process group. It kills and reaps
+leftover helpers and removes each unit only after confirming it stopped. If
+cleanup fails, it reports the errors together and retains staging under
+`/run` for recovery. SIGKILL of the privileged supervisor itself bypasses
+cleanup and requires an external owner, such as the disposable VM lifecycle.
+The caller writes unit and legacy relay logs under `target/tmp/` for CI upload.
 Plain `cargo test` leaves these cases ignored.
 
 Strict discovery retirement is a local qualification case expected to fail on

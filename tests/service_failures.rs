@@ -125,12 +125,12 @@ async fn assert_netem(tunnel: &Tunnel, udp: &StreamerUdp, receiver: &EchoReceive
         .collect();
     assert!(
         (25..usize::from(COUNT)).contains(&ingress.len()),
-        "egress loss: {}",
+        "unexpected outbound delivery count: {}",
         ingress.len()
     );
     assert!(
         (15..ingress.len()).contains(&echoed.len()),
-        "return loss: {}",
+        "unexpected echo count: {}",
         echoed.len()
     );
     assert!(
@@ -195,31 +195,38 @@ async fn service_uplinks_survive_netem_cuts_renumbering_and_replug() {
     );
     assert!(
         delayed.elapsed() >= Duration::from_millis(110),
-        "delay missing on one direction"
+        "tagged echo RTT under 110 ms with both netem delays configured"
     );
     WAN_A.netem(
         &bench.peer,
         &["delay", "60ms", "loss", "20%", "reorder", "75%", "gap", "3"],
     );
+    let before = WAN_A.netem_drops(&bench.peer);
     tokio::join!(
         assert_netem(&a, &bench.udp, &bench.receiver),
         b.carries(&udp_b, "unaffected during netem")
     );
+    let after = WAN_A.netem_drops(&bench.peer);
+    assert!(
+        after.0 > before.0 && after.1 > before.1,
+        "netem reported no drops on at least one direction: {before:?} -> {after:?}"
+    );
     assert_eq!(receiver_b.received().last().unwrap().1.ip(), WAN_B.ip(1));
 
     // Demonstrate that the original tunnel can age without closing while
-    // receiving replies. The cut must start a fresh destination deadline.
+    // receiving replies past the longest accepted post-cut interval.
+    // A fixed tunnel lifetime must not satisfy the destination deadline.
     WAN_A.netem(&bench.peer, &[]);
     let age_started = Instant::now();
-    while age_started.elapsed() < Duration::from_secs(8) {
+    while age_started.elapsed() < Duration::from_secs(42) {
         let sequence = age_started.elapsed().as_millis();
         a.carries(&bench.udp, &format!("age uplink A {sequence}"))
             .await;
         b.carries(&udp_b, &format!("age uplink B {sequence}")).await;
         sleep(Duration::from_millis(250)).await;
     }
-    let cut = Instant::now();
     WAN_A.netem(&bench.peer, &["loss", "100%"]);
+    let cut = Instant::now();
     a.quiet(&bench.udp, "blackhole A", &[&bench.receiver, &receiver_b])
         .await;
     b.carries(&udp_b, "unaffected during blackhole").await;
@@ -391,7 +398,7 @@ async fn service_crash_backoff_start_limit_and_operator_recovery() {
         unit.property("ActiveState") == "failed"
     })
     .await;
-    unit.assert_backoff_journal();
+    unit.assert_backoff_journal().await;
     assert_eq!(unit.pid(), 0);
     restarted
         .quiet(&bench.udp, "rate-limited tunnel", &[&bench.receiver])
@@ -400,7 +407,7 @@ async fn service_crash_backoff_start_limit_and_operator_recovery() {
     unit.set_ready(true);
     // Some systemd versions preserve the last exit code in Result, so
     // exercise the blocked start with the readiness check repaired.
-    unit.assert_start_rejected();
+    unit.assert_start_rejected().await;
     bench
         .streamer
         .assert_no_more_connections(Duration::from_millis(3200))
