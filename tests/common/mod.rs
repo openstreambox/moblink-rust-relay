@@ -112,6 +112,7 @@ pub struct Session {
     pub challenge: String,
     pub authentication: String,
     pub peer: SocketAddr,
+    pub accepted_at: Instant,
     commands: mpsc::Sender<SessionCommand>,
     responses: mpsc::Receiver<Value>,
     ended: watch::Receiver<Option<Ended>>,
@@ -254,12 +255,13 @@ impl FakeMoblin {
                 let Ok((stream, peer)) = listener.accept().await else {
                     return;
                 };
+                let accepted_at = Instant::now();
                 connection += 1;
                 accepted_tx.send_replace(connection);
                 let session_tx = session_tx.clone();
                 let rejected_tx = rejected_tx.clone();
                 tokio::spawn(async move {
-                    match handshake(stream, peer, connection).await {
+                    match handshake(stream, peer, connection, accepted_at).await {
                         Ok(Some(session)) => {
                             session_tx.send(session).await.ok();
                         }
@@ -348,6 +350,7 @@ async fn handshake(
     stream: TcpStream,
     peer: SocketAddr,
     connection: u32,
+    accepted_at: Instant,
 ) -> Result<Option<Session>, Box<dyn std::error::Error + Send + Sync>> {
     let mut ws = accept_async(stream).await?;
     // Fresh per connection, so a replayed identify cannot pass.
@@ -400,6 +403,7 @@ async fn handshake(
         authentication: authentication.to_string(),
         challenge,
         peer,
+        accepted_at,
         commands,
         responses,
         ended,

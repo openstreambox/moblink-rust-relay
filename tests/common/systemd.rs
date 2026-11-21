@@ -5,11 +5,11 @@ use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use serde_json::Value;
 use tokio::time::{Instant, sleep};
-use uuid::Uuid;
 
 use super::PASSWORD;
 
@@ -34,7 +34,17 @@ impl Unit {
             "see the test instructions before running the systemd tests"
         );
         let binary = release_binary("MOBLINK_RELAY_SERVICE_BIN");
-        let name = format!("moblink-test-{}.service", Uuid::new_v4());
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let slot = COUNTER.fetch_add(1, Ordering::Relaxed);
+        assert!(slot < 2, "launcher reserves two unit names per case");
+        let prefix = std::env::var("MOBLINK_TEST_UNIT_PREFIX").expect("unit prefix from launcher");
+        assert!(
+            prefix.starts_with("moblink-tests.")
+                && prefix
+                    .bytes()
+                    .all(|c| { c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-' | b'_') })
+        );
+        let name = format!("{prefix}-{slot}.service");
         let runtime = Path::new("/run/systemd/system");
         let path = runtime.join(&name);
         let dropin = runtime.join(format!("{name}.d"));
@@ -123,6 +133,71 @@ impl Unit {
             !output.status.success(),
             "rate-limited unit accepted a start: {output:?}"
         );
+        assert!(
+            self.property("Result") == "start-limit-hit"
+                || self
+                    .journal()
+                    .iter()
+                    .filter(|entry| {
+                        entry["MESSAGE"].as_str().is_some_and(|message| {
+                            message.contains("Start request repeated too quickly")
+                        })
+                    })
+                    .count()
+                    >= 2,
+            "systemd did not report start-rate limiting"
+        );
+    }
+
+    fn journal(&self) -> Vec<Value> {
+        let output = Command::new("journalctl")
+            .args(["--no-pager", "--sync"])
+            .output()
+            .expect("sync system journal");
+        assert_ok(output);
+        let output = Command::new("journalctl")
+            .args(["--no-pager", "--output=json", "--unit", &self.name])
+            .output()
+            .expect("read system journal");
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    pub fn assert_backoff_journal(&self) {
+        let journal = self.journal();
+        let events: Vec<_> = journal
+            .iter()
+            .filter_map(|entry| {
+                let message = entry["MESSAGE"].as_str()?;
+                let time: u64 = entry["__MONOTONIC_TIMESTAMP"].as_str()?.parse().unwrap();
+                let phase = if message.contains("restart counter is at 2.") {
+                    "first retry"
+                } else if message == "fixture-pre-start-failed" {
+                    "failure"
+                } else if message.contains("Start request repeated too quickly") {
+                    "limit"
+                } else {
+                    return None;
+                };
+                Some((phase, time))
+            })
+            .collect();
+        assert_eq!(
+            events.iter().map(|(phase, _)| *phase).collect::<Vec<_>>(),
+            ["first retry", "failure", "failure", "limit"],
+            "{events:?}"
+        );
+        for pair in events[1..].windows(2) {
+            let gap = Duration::from_micros(pair[1].1 - pair[0].1);
+            assert!(
+                (Duration::from_millis(2800)..=Duration::from_secs(5)).contains(&gap),
+                "expected capped 3s backoff, got {gap:?}: {events:?}"
+            );
+        }
     }
 
     pub fn crash(&self) {
@@ -186,7 +261,7 @@ impl Drop for Unit {
 
 fn ctl(args: &[&str]) -> Output {
     Command::new("timeout")
-        .args(["15s", "systemctl", "--no-ask-password"])
+        .args(["--foreground", "15s", "systemctl", "--no-ask-password"])
         .args(args)
         .output()
         .expect("run systemctl")
