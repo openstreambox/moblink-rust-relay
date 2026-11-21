@@ -12,7 +12,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use common::*;
-use mdns_sd::{IfKind, ServiceDaemon, ServiceInfo, UnregisterStatus};
+use mdns_sd::{IfKind, ServiceDaemon, ServiceEvent, ServiceInfo, UnregisterStatus};
 use netns::{ip, require_private_netns};
 use systemd::{LEGACY_OWNER, NO_OWNER, SYSTEMD_OWNER, Unit, release_binary};
 use tokio::time::{Instant, sleep, timeout};
@@ -84,8 +84,7 @@ impl Tunnel {
 async fn assert_netem(tunnel: &Tunnel, udp: &StreamerUdp, receiver: &EchoReceiver) {
     const COUNT: u8 = 120;
     let before = receiver.count();
-    let started = Instant::now();
-    let mut first_echo = None;
+    let (sent, all_sent) = tokio::sync::oneshot::channel();
     let mut echoed = Vec::new();
     let send = async {
         for sequence in 0..COUNT {
@@ -95,6 +94,7 @@ async fn assert_netem(tunnel: &Tunnel, udp: &StreamerUdp, receiver: &EchoReceive
                 .unwrap();
             sleep(Duration::from_millis(2)).await;
         }
+        sent.send(()).unwrap();
     };
     let recv = async {
         let mut buf = [0; 2048];
@@ -102,12 +102,19 @@ async fn assert_netem(tunnel: &Tunnel, udp: &StreamerUdp, receiver: &EchoReceive
             if let Ok((2, _)) = udp.socket.recv_from(&mut buf).await
                 && buf[0] == 0xfe
             {
-                first_echo.get_or_insert_with(|| started.elapsed());
                 echoed.push(buf[1]);
             }
         }
     };
-    let (_, _) = tokio::join!(send, timeout(Duration::from_secs(1), recv));
+    let drain = async {
+        all_sent.await.unwrap();
+        // Wait after the last send, so a slow sender does not turn delayed
+        // packets into apparent loss. Both qdiscs have a 60 ms delay.
+        sleep(Duration::from_millis(500)).await;
+    };
+    tokio::join!(send, async {
+        tokio::select! { () = recv => {}, () = drain => {} }
+    });
     let received = receiver.received();
     let ingress: Vec<_> = received[before..]
         .iter()
@@ -140,9 +147,8 @@ async fn assert_netem(tunnel: &Tunnel, udp: &StreamerUdp, receiver: &EchoReceive
         return_order.windows(2).any(|pair| pair[0] > pair[1]),
         "no return-path reordering"
     );
-    assert!(first_echo.is_some(), "no delayed echo");
     eprintln!(
-        "netem delivered {} outbound and {} round trips, first echo {first_echo:?}",
+        "netem delivered {} outbound and {} round trips",
         ingress.len(),
         echoed.len()
     );
@@ -181,7 +187,12 @@ async fn service_uplinks_survive_netem_cuts_renumbering_and_replug() {
     // to both veth ends, so the impairment affects both directions.
     WAN_A.netem(&bench.peer, &["delay", "60ms"]);
     let delayed = Instant::now();
-    a.carries(&bench.udp, "delayed A").await;
+    assert!(
+        bench
+            .udp
+            .round_trip_to(a.socket, b"single delayed packet")
+            .await
+    );
     assert!(
         delayed.elapsed() >= Duration::from_millis(110),
         "delay missing on one direction"
@@ -196,43 +207,63 @@ async fn service_uplinks_survive_netem_cuts_renumbering_and_replug() {
     );
     assert_eq!(receiver_b.received().last().unwrap().1.ip(), WAN_B.ip(1));
 
-    WAN_A.netem(&bench.peer, &["loss", "100%"]);
+    // Demonstrate that the original tunnel can age without closing while
+    // receiving replies. The cut must start a fresh destination deadline.
+    WAN_A.netem(&bench.peer, &[]);
+    let age_started = Instant::now();
+    while age_started.elapsed() < Duration::from_secs(8) {
+        let sequence = age_started.elapsed().as_millis();
+        a.carries(&bench.udp, &format!("age uplink A {sequence}"))
+            .await;
+        b.carries(&udp_b, &format!("age uplink B {sequence}")).await;
+        sleep(Duration::from_millis(250)).await;
+    }
     let cut = Instant::now();
+    WAN_A.netem(&bench.peer, &["loss", "100%"]);
     a.quiet(&bench.udp, "blackhole A", &[&bench.receiver, &receiver_b])
         .await;
     b.carries(&udp_b, "unaffected during blackhole").await;
-    // Retain the IP and feed the broken path to exercise the UDP destination
-    // receive timeout. An entirely idle tunnel has a different timeout path.
+    // Retain the IP and keep sending into both tunnels. Check control
+    // during the outage and time the close as seen by the WebSocket task.
     let pump = async {
-        while !a.session.is_closed() {
+        let mut sequence = 0;
+        loop {
+            let payload = format!("blackhole keep sending {sequence}");
             bench
                 .udp
                 .socket
-                .send_to(b"blackhole keep sending", a.socket)
+                .send_to(payload.as_bytes(), a.socket)
                 .await
                 .unwrap();
-            sleep(Duration::from_millis(250)).await;
-        }
-    };
-    let keep_b_live = async {
-        let mut sequence = 0;
-        while !a.session.is_closed() {
             b.carries(&udp_b, &format!("unaffected during blackhole {sequence}"))
                 .await;
             sequence += 1;
-            sleep(Duration::from_millis(500)).await;
+            sleep(Duration::from_millis(250)).await;
         }
-        assert!(sequence > 1, "no sustained unaffected traffic");
     };
-    timeout(Duration::from_secs(40), async {
-        tokio::join!(pump, keep_b_live)
-    })
-    .await
-    .expect("silent destination never retired");
+    let observe = async {
+        sleep(Duration::from_secs(12)).await;
+        let status = a.session.status().await;
+        assert!(status["response"]["result"].get("ok").is_some(), "{status}");
+        a.session.wait_ended(Duration::from_secs(28)).await
+    };
+    let ended = tokio::select! {
+        ended = observe => ended,
+        () = pump => unreachable!(),
+    };
+    let elapsed = ended.at - cut;
     assert!(
-        cut.elapsed() >= Duration::from_secs(25),
-        "premature destination timeout"
+        (Duration::from_secs(25)..=Duration::from_secs(40)).contains(&elapsed),
+        "destination timeout outside its window: {elapsed:?}, {ended:?}"
     );
+    for receiver in [&bench.receiver, &receiver_b] {
+        assert!(
+            !receiver
+                .received()
+                .iter()
+                .any(|(payload, _)| { payload.starts_with(b"blackhole keep sending") })
+        );
+    }
     let retry = bench.streamer.next_session(START).await;
     assert_eq!(retry.relay_id, id);
     WAN_A.netem(&bench.peer, &[]);
@@ -264,6 +295,7 @@ async fn service_uplinks_survive_netem_cuts_renumbering_and_replug() {
     let renumbered = bench.streamer.next_session(START).await;
     assert_eq!(renumbered.relay_id, id);
     assert_ne!(renumbered.challenge, a.session.challenge);
+    assert_retired_socket(a.socket.port());
     a = Tunnel::start(renumbered, &bench.receiver).await;
     a.carries(&bench.udp, "renumbered A").await;
     let (payload, source) = bench.receiver.received().pop().unwrap();
@@ -275,16 +307,31 @@ async fn service_uplinks_survive_netem_cuts_renumbering_and_replug() {
     a.quiet(&bench.udp, "unplugged A", &[&bench.receiver, &receiver_b])
         .await;
     b.carries(&udp_b, "unaffected during replug").await;
-    // Deleting the veth destroys the peer device too. Rebind the receiver in
-    // the recreated peer network to avoid relying on a stale socket.
-    drop(bench.receiver);
-    WAN_A.add(&bench.peer, 1);
-    let restored = EchoReceiver::from_socket(bench.peer.udp(WAN_A.ip(2)));
-    let fresh = Tunnel::start(bench.streamer.next_session(START).await, &restored).await;
+    // Restore both endpoints with their old addresses so a surviving
+    // tunnel would have a route to its original receiver.
+    WAN_A.add(&bench.peer, 3);
+    let replugged = bench.streamer.next_session(START).await;
+    a.quiet(
+        &bench.udp,
+        "old tunnel on restored link",
+        &[&bench.receiver, &receiver_b],
+    )
+    .await;
+    assert_retired_socket(a.socket.port());
+    let fresh = Tunnel::start(replugged, &bench.receiver).await;
     assert_eq!(fresh.session.relay_id, id);
     fresh.carries(&bench.udp, "replugged A").await;
-    assert_eq!(restored.received().last().unwrap().1.ip(), WAN_A.ip(1));
+    assert_eq!(
+        bench.receiver.received().last().unwrap().1.ip(),
+        WAN_A.ip(3)
+    );
     assert_eq!(unit.pid(), pid);
+}
+
+fn assert_retired_socket(port: u16) {
+    // The streamer-facing socket binds wildcard IPv4.
+    std::net::UdpSocket::bind(("0.0.0.0", port))
+        .unwrap_or_else(|error| panic!("retired UDP port {port} is still bound: {error}"));
 }
 
 async fn assert_authenticated(unit: &Unit, pid: u32, manual: bool) {
@@ -311,6 +358,7 @@ async fn service_crash_backoff_start_limit_and_operator_recovery() {
     let mut old = Tunnel::start(bench.streamer.next_session(START).await, &bench.receiver).await;
     old.carries(&bench.udp, "before crash").await;
     assert_authenticated(&unit, pid, true).await;
+    assert_eq!(bench.streamer.accepted(), 1);
 
     let crashed = Instant::now();
     unit.crash();
@@ -318,10 +366,11 @@ async fn service_crash_backoff_start_limit_and_operator_recovery() {
     old.quiet(&bench.udp, "crashed tunnel", &[&bench.receiver])
         .await;
     let session = bench.streamer.next_session(START).await;
+    assert_eq!(bench.streamer.accepted(), 2);
+    let first_restart = session.accepted_at - crashed;
     assert!(
-        (Duration::from_millis(900)..Duration::from_secs(10)).contains(&crashed.elapsed()),
-        "first restart outside its 1s backoff window: {:?}",
-        crashed.elapsed()
+        (Duration::from_millis(900)..Duration::from_secs(10)).contains(&first_restart),
+        "first restart outside its 1s backoff window: {first_restart:?}"
     );
     let restarted_pid = unit.pid();
     assert_ne!(restarted_pid, 0);
@@ -336,17 +385,13 @@ async fn service_crash_backoff_start_limit_and_operator_recovery() {
     // pre-start readiness check failing. Leave the activation record in place
     // so systemd must exhaust its restart budget.
     unit.set_ready(false);
-    let failures = Instant::now();
     unit.crash();
     restarted.session.wait_ended(START).await;
     unit.wait_for("retry budget exhausted", || {
         unit.property("ActiveState") == "failed"
     })
     .await;
-    assert!(
-        failures.elapsed() >= Duration::from_secs(5),
-        "retries did not back off"
-    );
+    unit.assert_backoff_journal();
     assert_eq!(unit.pid(), 0);
     restarted
         .quiet(&bench.udp, "rate-limited tunnel", &[&bench.receiver])
@@ -470,6 +515,66 @@ fn publish(publisher: &ServiceDaemon, instance: &str, addr: SocketAddr) -> Strin
     fullname
 }
 
+async fn confirm_advertisement(name: &str, addr: SocketAddr) {
+    let browser = ServiceDaemon::new().unwrap();
+    browser.disable_interface(IfKind::All).unwrap();
+    browser
+        .enable_interface(IfKind::Name(PHONE.relay.into()))
+        .unwrap();
+    let events = browser.browse(MDNS_TYPE).unwrap();
+    timeout(START, async {
+        while let Ok(event) = events.recv_async().await {
+            if let ServiceEvent::ServiceResolved(info) = event
+                && info.get_fullname() == name
+                && info.get_port() == addr.port()
+                && let std::net::IpAddr::V4(ip) = addr.ip()
+                && info.get_addresses_v4().contains(&ip)
+            {
+                return;
+            }
+        }
+        panic!("mDNS observer shut down before resolving {name}");
+    })
+    .await
+    .unwrap_or_else(|_| panic!("mDNS observer did not resolve {name} at {addr}"));
+    timeout(START, browser.shutdown().unwrap().recv_async())
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+async fn assert_ignores_advertisements(unit: &Unit, listeners: &[(&FakeMoblin, u32)]) {
+    let urls: Vec<_> = listeners
+        .iter()
+        .map(|(listener, _)| format!("ws://{}", listener.addr))
+        .collect();
+    let deadline = Instant::now() + Duration::from_secs(7);
+    loop {
+        for (listener, before) in listeners {
+            assert_eq!(
+                listener.accepted(),
+                *before,
+                "unexpected connection to {}",
+                listener.addr
+            );
+        }
+        let status = unit.status().expect("runtime status published");
+        for field in ["streamers", "relays"] {
+            for entry in status[field].as_array().unwrap() {
+                assert!(
+                    urls.iter()
+                        .all(|url| entry["url"] != *url && entry["streamer_url"] != *url),
+                    "unexpected advertisement in {field}: {entry}"
+                );
+            }
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
 async fn mdns_reannouncement(strict_retirement: bool) {
     let mut bench = Bench::new();
     bench.peer.enter(|| {
@@ -545,20 +650,12 @@ async fn mdns_reannouncement(strict_retirement: bool) {
     let mut same_name = FakeMoblin::from_listener(bench.peer.tcp(PHONE.ip(3)));
     let local = FakeMoblin::bind((PHONE.ip(1), 0).into()).await;
     publish(&publisher, &format!("{instance}-other"), same_name.addr);
-    publish(&publisher, &format!("{instance}-self"), local.addr);
+    let self_name = publish(&publisher, &format!("{instance}-self"), local.addr);
+    confirm_advertisement(&self_name, local.addr).await;
     let other = Tunnel::start(same_name.next_session(START).await, &bench.receiver).await;
     other.carries(&bench.udp, "same display name").await;
     current.carries(&bench.udp, "original display name").await;
-    let self_url = format!("ws://{}", local.addr);
-    assert!(
-        unit.status().unwrap()["streamers"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|entry| entry["url"] != self_url),
-        "self advertisement was added to runtime status"
-    );
-    assert_eq!(local.accepted(), 0);
+    assert_ignores_advertisements(&unit, &[(&local, 0)]).await;
 
     unit.action("stop");
     let fixed = Unit::install(WAN_A.relay, Some(bench.streamer.addr));
@@ -571,12 +668,19 @@ async fn mdns_reannouncement(strict_retirement: bool) {
     let direct = Tunnel::start(bench.streamer.next_session(START).await, &bench.receiver).await;
     direct.carries(&bench.udp, "fixed URL bypass").await;
     assert_authenticated(&fixed, fixed.pid(), true).await;
-    assert_eq!(
-        moved.accepted(),
-        moved_before,
-        "fixed URL mode connected to multicast advertisement"
-    );
-    assert_eq!(same_name.accepted(), same_name_before);
+    let unwanted = FakeMoblin::from_listener(bench.peer.tcp(PHONE.ip(3)));
+    let fixed_name = publish(&publisher, &format!("{instance}-fixed"), unwanted.addr);
+    confirm_advertisement(&fixed_name, unwanted.addr).await;
+    assert_ignores_advertisements(
+        &fixed,
+        &[
+            (&unwanted, 0),
+            (&moved, moved_before),
+            (&same_name, same_name_before),
+            (&local, 0),
+        ],
+    )
+    .await;
     let status = fixed.status().unwrap();
     assert_eq!(status["streamers"].as_array().unwrap().len(), 1);
     timeout(START, publisher.shutdown().unwrap().recv_async())
