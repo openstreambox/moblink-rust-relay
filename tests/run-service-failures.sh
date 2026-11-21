@@ -40,10 +40,18 @@ print(executables[0])
 '
 )
 
+for test_name in "${test_names[@]}"; do
+  selection=$("$test_bin" --include-ignored --exact "$test_name" --list --format terse)
+  if [[ "$selection" != "$test_name: test" ]]; then
+    printf 'Expected exactly one test for %s, got %q\n' "$test_name" "$selection" >&2
+    exit 1
+  fi
+done
+
 sudo -n modprobe veth
 sudo -n modprobe sch_netem
 # Staging, the process group, runtime units and diagnostics share one
 # privileged owner with cleanup even if an individual harness is killed.
 log_dir="$PWD/target/tmp"
 mkdir -p "$log_dir"
-exec sudo -n python3 tests/run-service-cases.py "$test_bin" "$artifact_dir" "$log_dir" "${test_names[@]}"
+exec python3 tests/run-service-cases.py --launch "$log_dir" "$test_bin" "$artifact_dir" "${test_names[@]}"
