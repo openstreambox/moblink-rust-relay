@@ -11,7 +11,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
@@ -151,7 +151,7 @@ struct RelayServiceInner {
     password: String,
     network_interface_filter: NetworkInterfaceFilter,
     get_status: Option<GetStatusClosure>,
-    status: Status,
+    status: watch::Sender<Status>,
     relays: Vec<ServiceRelay>,
     network_interfaces: Vec<NetworkInterface>,
     discovered_streamers: HashMap<String, Streamer>,
@@ -179,7 +179,7 @@ impl RelayServiceInner {
                     network_interfaces_to_ignore,
                 ),
                 get_status,
-                status: Default::default(),
+                status: watch::channel(Status::default()).0,
                 relays: Vec::new(),
                 network_interfaces: Vec::new(),
                 discovered_streamers: HashMap::new(),
@@ -294,11 +294,12 @@ impl RelayServiceInner {
     }
 
     async fn update_status(&mut self) {
-        self.status = if let Some(get_status) = &self.get_status {
+        let status = if let Some(get_status) = &self.get_status {
             get_status().await
         } else {
             Status::default()
-        }
+        };
+        self.status.send_replace(status);
     }
 
     async fn update_discovered_streamer(&mut self, fullname: String, streamer: Option<Streamer>) {
@@ -355,16 +356,12 @@ impl RelayServiceInner {
     }
 
     pub fn create_get_status_closure(&self) -> Option<GetStatusClosure> {
-        let relay_service = self.me.clone();
+        let status = self.status.subscribe();
         Some(Box::new(move || {
-            let relay_service = relay_service.clone();
-            Box::pin(async move {
-                if let Some(relay_service) = relay_service.upgrade() {
-                    relay_service.lock().await.status.clone()
-                } else {
-                    Status::default()
-                }
-            })
+            // The reader holds its relay lock while reconciliation may hold
+            // the service lock and wait for that relay to stop.
+            let status = status.borrow().clone();
+            Box::pin(async move { status })
         }))
     }
 
@@ -449,7 +446,187 @@ impl RelayService {
 
 #[cfg(test)]
 mod tests {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio::net::{TcpListener, TcpStream, UdpSocket};
+    use tokio::sync::Notify;
+    use tokio::time::timeout;
+    use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::{WebSocketStream, accept_async};
+
     use super::*;
+    use crate::protocol::{
+        MessageRequest, MessageRequestData, MessageToRelay, MessageToStreamer, Present,
+        ResponseData, StartTunnelRequest,
+    };
+
+    async fn send_request(
+        peer: &mut WebSocketStream<TcpStream>,
+        id: u32,
+        data: MessageRequestData,
+    ) {
+        let request = MessageToRelay::Request(MessageRequest { id, data });
+        peer.send(Message::Text(
+            serde_json::to_string(&request).unwrap().into(),
+        ))
+        .await
+        .unwrap();
+    }
+
+    async fn next_response(peer: &mut WebSocketStream<TcpStream>, id: u32) -> ResponseData {
+        let message = peer.next().await.unwrap().unwrap();
+        let MessageToStreamer::Response(response) =
+            serde_json::from_str(message.to_text().unwrap()).unwrap()
+        else {
+            panic!("expected response to {id}");
+        };
+        assert_eq!(response.id, id);
+        response.data
+    }
+
+    #[tokio::test]
+    async fn withdrawal_during_status_stops_websocket_and_both_udp_paths() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let destination = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let service =
+            RelayServiceInner::new(String::new(), vec![], vec![], None, PathBuf::new()).await;
+        let mut service = service.lock().await;
+        service.status.send_replace(Status {
+            battery_percentage: Some(73),
+        });
+        let entered = Arc::new(Notify::new());
+        let resume = Arc::new(Notify::new());
+        let snapshot = Arc::new(service.create_get_status_closure().unwrap());
+        let get_status: GetStatusClosure = {
+            let entered = entered.clone();
+            let resume = resume.clone();
+            Box::new(move || {
+                let entered = entered.clone();
+                let resume = resume.clone();
+                let snapshot = snapshot.clone();
+                Box::pin(async move {
+                    entered.notify_one();
+                    resume.notified().await;
+                    snapshot().await
+                })
+            })
+        };
+        let address = Ipv4Addr::LOCALHOST;
+        service.network_interfaces = vec![NetworkInterface::new_afinet(
+            "lo", address, None, None, 1, true,
+        )];
+        let fullname = format!("Streamer.{MDNS_SERVICE_TYPE}");
+        let name = "Streamer".to_owned();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        service
+            .update_discovered_streamer(
+                fullname.clone(),
+                Some(Streamer {
+                    name: name.clone(),
+                    url: url.clone(),
+                }),
+            )
+            .await;
+
+        let limit = Duration::from_secs(3);
+        let (relay, mut peer) = timeout(limit, async {
+            tokio::join!(
+                ServiceRelay::new(
+                    "lo".into(),
+                    address,
+                    name,
+                    url,
+                    String::new(),
+                    Some(get_status),
+                    service.database.clone(),
+                ),
+                async {
+                    accept_async(listener.accept().await.unwrap().0)
+                        .await
+                        .unwrap()
+                },
+            )
+        })
+        .await
+        .expect("establish live WebSocket");
+        service.relays.push(relay);
+
+        let (streamer_port, return_addr) = timeout(limit, async {
+            send_request(
+                &mut peer,
+                1,
+                MessageRequestData::StartTunnel(StartTunnelRequest {
+                    address: address.to_string(),
+                    port: destination.local_addr().unwrap().port(),
+                }),
+            )
+            .await;
+            let ResponseData::StartTunnel(tunnel) = next_response(&mut peer, 1).await else {
+                panic!("expected tunnel response");
+            };
+            let streamer_port = (address, tunnel.port);
+            sender.send_to(b"outbound", streamer_port).await.unwrap();
+            let mut buf = [0; 32];
+            let (len, return_addr) = destination.recv_from(&mut buf).await.unwrap();
+            assert_eq!(&buf[..len], b"outbound");
+            destination.send_to(b"inbound", return_addr).await.unwrap();
+            let (len, _) = sender.recv_from(&mut buf).await.unwrap();
+            assert_eq!(&buf[..len], b"inbound");
+            (streamer_port, return_addr)
+        })
+        .await
+        .expect("prove traffic in both directions before withdrawal");
+
+        timeout(limit, async {
+            send_request(&mut peer, 2, MessageRequestData::Status(Present {})).await;
+            entered.notified().await;
+            // The reader owns the relay lock. Poll withdrawal first, under
+            // the service lock, before allowing the reader to fetch status.
+            tokio::join!(
+                biased;
+                service.update_discovered_streamer(fullname, None),
+                async {
+                    resume.notify_one();
+                    let ResponseData::Status(status) = next_response(&mut peer, 2).await else {
+                        panic!("expected status response");
+                    };
+                    assert_eq!(status.battery_percentage, Some(73));
+                    assert!(matches!(peer.next().await, Some(Ok(Message::Close(_)))));
+                    // Read TCP directly without flushing its queued
+                    // close reply. The relay must close TCP by itself.
+                    let tcp = peer.get_mut();
+                    assert_eq!(tcp.read(&mut [0]).await.unwrap(), 0);
+                },
+            );
+        })
+        .await
+        .expect("withdrawal must finish while the peer withholds its close reply");
+        assert!(service.relays.is_empty());
+        assert!(service.discovered_streamers.is_empty());
+
+        sender
+            .send_to(b"retired-outbound", streamer_port)
+            .await
+            .unwrap();
+        destination
+            .send_to(b"retired-inbound", return_addr)
+            .await
+            .unwrap();
+        let quiet = Duration::from_millis(250);
+        let mut outbound = [0; 32];
+        let mut inbound = [0; 32];
+        let (outbound, inbound, retry) = tokio::join!(
+            timeout(quiet, destination.recv_from(&mut outbound)),
+            timeout(quiet, sender.recv_from(&mut inbound)),
+            timeout(Duration::from_secs(6), listener.accept()),
+        );
+        assert!(
+            outbound.is_err(),
+            "retired outbound tunnel forwarded traffic"
+        );
+        assert!(inbound.is_err(), "retired inbound tunnel forwarded traffic");
+        assert!(retry.is_err(), "retired relay reconnected");
+    }
 
     #[tokio::test]
     async fn replacing_or_removing_discovered_url_retires_only_its_relay() {

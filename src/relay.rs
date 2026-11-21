@@ -12,7 +12,8 @@ use tokio::fs::File;
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::process::Command;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
+use tokio::task::JoinHandle;
 use tokio::time::{Duration, sleep, timeout};
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
@@ -41,12 +42,13 @@ struct RelayInner {
     on_status_updated: Option<Box<dyn Fn(String) + Send + Sync>>,
     get_status: Option<Arc<GetStatusClosure>>,
     ws_writer: Option<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>>,
+    ws_reader: Option<JoinHandle<()>>,
     started: bool,
     connected: bool,
     wrong_password: bool,
-    reconnect_on_tunnel_error: Arc<Mutex<bool>>,
     start_on_reconnect_soon: Arc<Mutex<bool>>,
-    relay_to_destination: Option<tokio::task::JoinHandle<Result<(), AnyError>>>,
+    relay_to_destination: Option<JoinHandle<Result<(), AnyError>>>,
+    relay_to_streamer: Option<JoinHandle<()>>,
 }
 
 impl RelayInner {
@@ -62,12 +64,13 @@ impl RelayInner {
                 on_status_updated: None,
                 get_status: None,
                 ws_writer: None,
+                ws_reader: None,
                 started: false,
                 connected: false,
                 wrong_password: false,
-                reconnect_on_tunnel_error: Arc::new(Mutex::new(false)),
                 start_on_reconnect_soon: Arc::new(Mutex::new(false)),
                 relay_to_destination: None,
+                relay_to_streamer: None,
             })
         })
     }
@@ -183,82 +186,102 @@ impl RelayInner {
         // Task to process messages received from the channel.
         let relay = self.me.clone();
 
-        tokio::spawn(async move {
-            let Some(relay_arc) = relay.upgrade() else {
-                return;
-            };
-
+        self.ws_reader = Some(tokio::spawn(async move {
             while let Some(result) = reader.next().await {
+                let Some(relay_arc) = relay.upgrade() else {
+                    return;
+                };
                 let mut relay = relay_arc.lock().await;
-                match result {
-                    Ok(message) => match message {
-                        Message::Text(text) => {
-                            match serde_json::from_str::<MessageToRelay>(&text) {
-                                Ok(message) => {
-                                    if let Err(error) = relay.handle_message(message).await {
+                let reconnect = match result {
+                    Ok(Message::Text(text)) => {
+                        match serde_json::from_str::<MessageToRelay>(&text) {
+                            Ok(message) => {
+                                match timeout(Duration::from_secs(5), relay.handle_message(message))
+                                    .await
+                                {
+                                    Ok(Ok(())) => false,
+                                    Ok(Err(error)) => {
                                         error!("Message handling failed with error: {}", error);
-                                        relay.reconnect_soon().await;
-                                        break;
+                                        true
+                                    }
+                                    Err(_) => {
+                                        debug!("WebSocket message handling timed out");
+                                        true
                                     }
                                 }
-                                _ => {
-                                    error!("Failed to deserialize message: {}", text);
-                                }
+                            }
+                            Err(_) => {
+                                error!("Failed to deserialize message: {}", text);
+                                false
                             }
                         }
-                        Message::Binary(data) => {
-                            debug!("Received binary message of length: {}", data.len());
-                        }
-                        Message::Ping(data) => {
-                            relay.send_message(Message::Pong(data)).await.ok();
-                        }
-                        Message::Pong(_) => {
-                            debug!("Received pong message");
-                        }
-                        Message::Close(frame) => {
-                            info!("Received close message: {:?}", frame);
-                            relay.reconnect_soon().await;
-                            break;
-                        }
-                        Message::Frame(_) => {
-                            unreachable!("This is never used")
-                        }
-                    },
-                    Err(e) => {
-                        debug!("Error processing message: {}", e);
-                        // TODO: There has to be a better way to handle this
-                        if e.to_string()
+                    }
+                    Ok(Message::Ping(data)) => {
+                        relay.send_message(Message::Pong(data)).await.ok();
+                        false
+                    }
+                    Ok(Message::Close(frame)) => {
+                        info!("Received close message: {:?}", frame);
+                        true
+                    }
+                    Ok(_) => false,
+                    Err(error) => {
+                        debug!("Error processing message: {}", error);
+                        if !error
+                            .to_string()
                             .contains("Connection reset without closing handshake")
                         {
-                            relay.reconnect_soon().await;
+                            break;
                         }
-                        break;
+                        true
                     }
+                };
+                if reconnect {
+                    // Detach this task so stop can join the other tasks without
+                    // waiting on the reader that is performing the reconnect.
+                    relay.ws_reader.take();
+                    drop(reader);
+                    relay.reconnect_soon().await;
+                    break;
                 }
             }
-        });
+        }));
     }
 
     async fn stop_internal(&mut self) {
+        *self.start_on_reconnect_soon.lock().await = false;
+        if let Some(reader) = self.ws_reader.take() {
+            reader.abort();
+            reader.await.ok();
+        }
+        self.stop_tunnel().await;
         if let Some(mut ws_writer) = self.ws_writer.take() {
-            match ws_writer.close().await {
-                Err(e) => {
-                    error!("Error closing WebSocket: {}", e);
-                }
-                _ => {
-                    debug!("WebSocket closed successfully");
-                }
+            match timeout(Duration::from_secs(2), ws_writer.close()).await {
+                Ok(Ok(())) => debug!("WebSocket closed successfully"),
+                Ok(Err(error)) => debug!("Error closing WebSocket: {}", error),
+                Err(_) => debug!("WebSocket close timed out"),
             }
         }
         self.connected = false;
         self.wrong_password = false;
-        *self.reconnect_on_tunnel_error.lock().await = false;
-        *self.start_on_reconnect_soon.lock().await = false;
-        if let Some(relay_to_destination) = self.relay_to_destination.take() {
-            relay_to_destination.abort();
-            relay_to_destination.await.ok();
-        }
         self.update_status();
+    }
+
+    async fn stop_tunnel(&mut self) {
+        let outbound = self.relay_to_destination.take();
+        let inbound = self.relay_to_streamer.take();
+        if let Some(task) = &outbound {
+            task.abort();
+        }
+        if let Some(task) = &inbound {
+            task.abort();
+        }
+        if let Some(task) = outbound {
+            task.await.ok();
+        }
+        if let Some(task) = inbound {
+            task.await.ok();
+        }
     }
 
     fn update_status(&self) {
@@ -279,7 +302,6 @@ impl RelayInner {
 
     async fn reconnect_soon(&mut self) {
         self.stop_internal().await;
-        *self.start_on_reconnect_soon.lock().await = false;
         let start_on_reconnect_soon = Arc::new(Mutex::new(true));
         self.start_on_reconnect_soon = start_on_reconnect_soon.clone();
         self.start_soon(start_on_reconnect_soon);
@@ -291,10 +313,12 @@ impl RelayInner {
         tokio::spawn(async move {
             sleep(Duration::from_secs(5)).await;
 
-            if *start_on_reconnect_soon.lock().await {
-                debug!("Reconnecting...");
-                if let Some(relay) = relay.upgrade() {
-                    relay.lock().await.start_internal().await;
+            if let Some(relay) = relay.upgrade() {
+                let mut relay = relay.lock().await;
+                let should_start = *start_on_reconnect_soon.lock().await;
+                if should_start {
+                    debug!("Reconnecting...");
+                    relay.start_internal().await;
                 }
             }
         });
@@ -352,6 +376,8 @@ impl RelayInner {
         request: &MessageRequest,
         start_tunnel: &StartTunnelRequest,
     ) -> Result<(), AnyError> {
+        self.stop_tunnel().await;
+
         // Pick bind addresses from the relay
         let local_bind_addr_for_streamer = parse_socket_addr("0.0.0.0")?;
         let local_bind_addr_for_destination = parse_socket_addr(&self.bind_address)?;
@@ -396,53 +422,58 @@ impl RelayInner {
         let destination_address = SocketAddr::new(destination_address, start_tunnel.port);
         info!("Destination address: {}", destination_address);
 
-        self.relay_to_destination = Some(
-            self.start_relay_from_streamer_to_destination(
-                streamer_socket,
-                destination_socket,
-                destination_address,
-            )
-            .await,
-        );
-
+        self.start_tunnel(streamer_socket, destination_socket, destination_address);
         Ok(())
     }
 
-    async fn start_relay_from_streamer_to_destination(
+    fn start_tunnel(
         &mut self,
         streamer_socket: Arc<UdpSocket>,
         destination_socket: Arc<UdpSocket>,
         destination_addr: SocketAddr,
-    ) -> tokio::task::JoinHandle<Result<(), AnyError>> {
-        *self.reconnect_on_tunnel_error.lock().await = false;
-        let reconnect_on_tunnel_error = Arc::new(Mutex::new(true));
-        self.reconnect_on_tunnel_error = reconnect_on_tunnel_error.clone();
+    ) {
+        let streamer_address = Arc::new(Mutex::new(None));
+        let first_packet = Arc::new(Notify::new());
+
         let relay = self.me.clone();
+        let input = streamer_socket.clone();
+        let output = destination_socket.clone();
+        let address = streamer_address.clone();
+        let ready = first_packet.clone();
+        self.relay_to_streamer = Some(tokio::spawn(async move {
+            // Start the return-path timeout only once the streamer is sending.
+            ready.notified().await;
+            loop {
+                if let Err(error) =
+                    relay_one_packet_from_destination_to_streamer(&input, &output, &address).await
+                {
+                    info!("(relay_to_streamer) Failed with error: {}", error);
+                    break;
+                }
+            }
 
-        tokio::spawn(async move {
-            let streamer_address = Arc::new(Mutex::new(None));
-            let mut relay_to_destination_started = false;
+            drop((input, output));
+            if let Some(relay) = relay.upgrade() {
+                let mut relay = relay.lock().await;
+                // This task owns the reconnect. Detach it before stopping
+                // the tunnel so the relay does not try to join it here.
+                relay.relay_to_streamer.take();
+                relay.reconnect_soon().await;
+            }
+        }));
+
+        self.relay_to_destination = Some(tokio::spawn(async move {
             let mut buf = [0; 2048];
-
             loop {
                 let (size, remote_addr) = streamer_socket.recv_from(&mut buf).await?;
                 destination_socket
                     .send_to(&buf[..size], &destination_addr)
                     .await?;
-                streamer_address.lock().await.replace(remote_addr);
-
-                if !relay_to_destination_started {
-                    start_relay_from_destination_to_streamer(
-                        relay.clone(),
-                        streamer_socket.clone(),
-                        destination_socket.clone(),
-                        streamer_address.clone(),
-                        reconnect_on_tunnel_error.clone(),
-                    );
-                    relay_to_destination_started = true;
+                if streamer_address.lock().await.replace(remote_addr).is_none() {
+                    first_packet.notify_one();
                 }
             }
-        })
+        }));
     }
 
     async fn handle_message_request_status(
@@ -467,7 +498,7 @@ impl RelayInner {
         let Some(writer) = self.ws_writer.as_mut() else {
             return Err("No websocket writer".into());
         };
-        writer.send(message).await?;
+        timeout(Duration::from_secs(5), writer.send(message)).await??;
         Ok(())
     }
 }
@@ -529,37 +560,6 @@ impl Relay {
     pub async fn stop(&self) {
         self.inner.lock().await.stop().await;
     }
-}
-
-fn start_relay_from_destination_to_streamer(
-    relay: Weak<Mutex<RelayInner>>,
-    streamer_socket: Arc<UdpSocket>,
-    destination_socket: Arc<UdpSocket>,
-    streamer_address: Arc<Mutex<Option<SocketAddr>>>,
-    reconnect_on_tunnel_error: Arc<Mutex<bool>>,
-) {
-    tokio::spawn(async move {
-        loop {
-            if let Err(error) = relay_one_packet_from_destination_to_streamer(
-                &streamer_socket,
-                &destination_socket,
-                &streamer_address,
-            )
-            .await
-            {
-                info!("(relay_to_streamer) Failed with error: {}", error);
-                break;
-            }
-        }
-
-        if *reconnect_on_tunnel_error.lock().await {
-            if let Some(relay) = relay.upgrade() {
-                relay.lock().await.reconnect_soon().await;
-            }
-        } else {
-            info!("Not reconnecting after tunnel error");
-        }
-    });
 }
 
 async fn relay_one_packet_from_destination_to_streamer(
