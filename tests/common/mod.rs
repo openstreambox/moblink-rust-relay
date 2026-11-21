@@ -19,9 +19,10 @@ use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, oneshot, watch};
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout, Instant};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{accept_async, WebSocketStream};
 use uuid::Uuid;
@@ -111,14 +112,33 @@ pub struct Session {
     pub peer: SocketAddr,
     commands: mpsc::Sender<SessionCommand>,
     responses: mpsc::Receiver<Value>,
-    closed: watch::Receiver<bool>,
+    ended: watch::Receiver<Option<Ended>>,
     next_id: u32,
+}
+
+/// How and when a session's connection ended.
+#[derive(Clone, Copy, Debug)]
+pub struct Ended {
+    pub at: Instant,
+    pub how: EndedBy,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EndedBy {
+    /// The relay sent a WebSocket close frame (also its reply to ours).
+    RelayCloseFrame,
+    /// The relay's side of the TCP connection ended without a close frame
+    /// being seen.
+    RelayDisconnect,
+    /// The test dropped the session.
+    Dropped,
 }
 
 enum SessionCommand {
     Send(Message),
-    /// Stop reading and writing but keep the TCP connection open, like a
-    /// frozen app or a path that silently drops everything.
+    /// Stop answering anything, pings included, but keep the TCP connection
+    /// open, like a frozen app or a path that silently drops everything. The
+    /// raw socket is still read, only to notice when the relay hangs up.
     GoSilent(oneshot::Sender<()>),
 }
 
@@ -174,6 +194,8 @@ impl Session {
         self.request(json!({ "status": {} })).await
     }
 
+    /// Sends a close frame and keeps the connection open until the relay
+    /// answers it or hangs up.
     pub async fn close(&self) {
         self.commands
             .send(SessionCommand::Send(Message::Close(None)))
@@ -188,14 +210,16 @@ impl Session {
     }
 
     pub fn is_closed(&self) -> bool {
-        *self.closed.borrow()
+        self.ended.borrow().is_some()
     }
 
-    pub async fn wait_closed(&mut self, limit: Duration) {
-        timeout(limit, self.closed.wait_for(|closed| *closed))
+    /// Waits for the connection to end and returns how and when it did.
+    pub async fn wait_ended(&mut self, limit: Duration) -> Ended {
+        let ended = timeout(limit, self.ended.wait_for(Option::is_some))
             .await
             .unwrap_or_else(|_| panic!("relay kept the session open for {limit:?}"))
-            .ok();
+            .expect("session task alive");
+        ended.expect("checked by wait_for")
     }
 }
 
@@ -203,7 +227,8 @@ pub struct FakeMoblin {
     pub addr: SocketAddr,
     sessions: mpsc::Receiver<Session>,
     rejected: watch::Receiver<u32>,
-    accept_task: tokio::task::JoinHandle<()>,
+    accepted: watch::Receiver<u32>,
+    accept_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl FakeMoblin {
@@ -216,6 +241,7 @@ impl FakeMoblin {
         let addr = listener.local_addr().unwrap();
         let (session_tx, sessions) = mpsc::channel(16);
         let (rejected_tx, rejected) = watch::channel(0);
+        let (accepted_tx, accepted) = watch::channel(0);
         let accept_task = tokio::spawn(async move {
             let mut connection = 0u32;
             loop {
@@ -223,6 +249,7 @@ impl FakeMoblin {
                     return;
                 };
                 connection += 1;
+                accepted_tx.send_replace(connection);
                 let session_tx = session_tx.clone();
                 let rejected_tx = rejected_tx.clone();
                 tokio::spawn(async move {
@@ -242,7 +269,8 @@ impl FakeMoblin {
             addr,
             sessions,
             rejected,
-            accept_task,
+            accepted,
+            accept_task: Some(accept_task),
         }
     }
 
@@ -267,10 +295,38 @@ impl FakeMoblin {
         *self.rejected.borrow()
     }
 
-    /// Closes the listening socket, as when Moblin quits. Sessions already
-    /// handed out stay open until they are dropped.
-    pub fn stop_listening(self) {
-        self.accept_task.abort();
+    /// TCP connections accepted so far, including any still in the handshake.
+    pub fn accepted(&self) -> u32 {
+        *self.accepted.borrow()
+    }
+
+    /// Checks that no further TCP connection arrives for `window`, which
+    /// should cover at least one relay retry interval.
+    pub async fn assert_no_more_connections(&self, window: Duration) {
+        let before = self.accepted();
+        sleep(window).await;
+        assert_eq!(
+            self.accepted(),
+            before,
+            "relay opened another connection within {window:?}"
+        );
+    }
+
+    /// Closes the listening socket, as when Moblin quits, and waits until it
+    /// is gone. Sessions already handed out stay open until they are dropped.
+    pub async fn stop_listening(mut self) {
+        if let Some(task) = self.accept_task.take() {
+            task.abort();
+            task.await.ok();
+        }
+    }
+}
+
+impl Drop for FakeMoblin {
+    fn drop(&mut self) {
+        if let Some(task) = self.accept_task.take() {
+            task.abort();
+        }
     }
 }
 
@@ -327,8 +383,8 @@ async fn handshake(
     }
     let (commands, command_rx) = mpsc::channel(16);
     let (response_tx, responses) = mpsc::channel(64);
-    let (closed_tx, closed) = watch::channel(false);
-    tokio::spawn(session_task(ws, command_rx, response_tx, closed_tx));
+    let (ended_tx, ended) = watch::channel(None);
+    tokio::spawn(session_task(ws, command_rx, response_tx, ended_tx));
     Ok(Some(Session {
         relay_id: identify["id"]
             .as_str()
@@ -340,7 +396,7 @@ async fn handshake(
         peer,
         commands,
         responses,
-        closed,
+        ended,
         next_id: 0,
     }))
 }
@@ -349,8 +405,14 @@ async fn session_task(
     mut ws: WebSocketStream<TcpStream>,
     mut commands: mpsc::Receiver<SessionCommand>,
     responses: mpsc::Sender<Value>,
-    closed: watch::Sender<bool>,
+    ended: watch::Sender<Option<Ended>>,
 ) {
+    let end = |how| {
+        ended.send_replace(Some(Ended {
+            at: Instant::now(),
+            how,
+        }));
+    };
     loop {
         tokio::select! {
             message = ws.next() => match message {
@@ -359,32 +421,42 @@ async fn session_task(
                         responses.send(value).await.ok();
                     }
                 }
+                Some(Ok(Message::Close(_))) => return end(EndedBy::RelayCloseFrame),
+                Some(Err(_)) | None => return end(EndedBy::RelayDisconnect),
                 // tungstenite queues the pong for pings by itself.
-                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
                 Some(Ok(_)) => {}
             },
             command = commands.recv() => match command {
+                // After our close frame, keep reading for the relay's reply.
                 Some(SessionCommand::Send(message)) => {
-                    let close = matches!(message, Message::Close(_));
-                    if ws.send(message).await.is_err() || close {
-                        break;
+                    if ws.send(message).await.is_err() {
+                        return end(EndedBy::RelayDisconnect);
                     }
                 }
                 Some(SessionCommand::GoSilent(done)) => {
                     done.send(()).ok();
-                    // Hold the socket without polling it until the session is
-                    // dropped (the command channel closes).
-                    while commands.recv().await.is_some() {}
-                    // A silent peer that comes back never sends a close frame.
-                    closed.send_replace(true);
-                    return;
+                    // Read raw bytes and discard them: no WebSocket processing,
+                    // so no pong or close reply ever goes out.
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        tokio::select! {
+                            read = ws.get_mut().read(&mut buf) => match read {
+                                Ok(0) | Err(_) => return end(EndedBy::RelayDisconnect),
+                                Ok(_) => {}
+                            },
+                            command = commands.recv() => {
+                                if command.is_none() {
+                                    return end(EndedBy::Dropped);
+                                }
+                            }
+                        }
+                    }
                 }
                 // Session dropped: the TCP connection goes with the stream.
-                None => break,
+                None => return end(EndedBy::Dropped),
             },
         }
     }
-    closed.send_replace(true);
 }
 
 // ---------------------------------------------------------------------------
@@ -488,8 +560,22 @@ impl StreamerUdp {
         .unwrap_or(false)
     }
 
-    /// Sends `payload` to a port that should no longer forward and checks that
-    /// it neither reaches `receiver` nor comes back within `window`.
+    /// Like `round_trip`, for the first exchange after the streamer moved to
+    /// a new source port. The relay records the sender only after forwarding,
+    /// so the reply to the first datagram can still go to the previous
+    /// address; up to three tagged attempts allow for that.
+    pub async fn round_trip_after_move(&self, relay_port: u16, payload: &str) -> bool {
+        for attempt in 1..=3 {
+            let tagged = format!("{payload} #{attempt}");
+            if self.round_trip(relay_port, tagged.as_bytes()).await {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Sends three tagged probes to a port that should no longer forward and
+    /// checks that none reaches `receiver` or comes back within `window`.
     pub async fn assert_quiet(
         &self,
         relay_port: u16,
@@ -498,15 +584,23 @@ impl StreamerUdp {
         window: Duration,
     ) {
         self.drain();
-        self.socket
-            .send_to(payload, ("127.0.0.1", relay_port))
-            .await
-            .ok();
+        let probes: Vec<Vec<u8>> = (1..=3)
+            .map(|i| [payload, format!(" #{i}").as_bytes()].concat())
+            .collect();
+        for probe in &probes {
+            self.socket
+                .send_to(probe, ("127.0.0.1", relay_port))
+                .await
+                .expect("send probe");
+            sleep(Duration::from_millis(50)).await;
+        }
         let mut buf = [0u8; 2048];
         let echoed = timeout(window, async {
             loop {
                 match self.socket.recv_from(&mut buf).await {
-                    Ok((size, _)) if &buf[..size] == payload => return,
+                    Ok((size, _)) if probes.iter().any(|p| &buf[..size] == p.as_slice()) => {
+                        return;
+                    }
                     _ => continue,
                 }
             }
@@ -514,10 +608,12 @@ impl StreamerUdp {
         .await
         .is_ok();
         assert!(!echoed, "retired port {relay_port} still answered");
-        assert!(
-            !receiver.has_received(payload),
-            "retired port {relay_port} still forwarded to the receiver"
-        );
+        for probe in &probes {
+            assert!(
+                !receiver.has_received(probe),
+                "retired port {relay_port} still forwarded to the receiver"
+            );
+        }
     }
 
     fn drain(&self) {

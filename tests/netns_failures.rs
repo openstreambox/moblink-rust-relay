@@ -1,6 +1,6 @@
 //! Uplink failure tests that change interfaces and addresses. They need
-//! CAP_NET_ADMIN, so they are ignored by default and must run inside a private
-//! network namespace, never on a host network:
+//! CAP_NET_ADMIN, so they are ignored by default and only run as an
+//! unprivileged user inside a network namespace owned by a new user namespace:
 //!
 //! ```sh
 //! cargo test --test netns_failures --no-run
@@ -8,9 +8,16 @@
 //!     sh -c 'ip link set lo up && cargo test --offline --test netns_failures -- --ignored'
 //! ```
 //!
+//! Prerequisites: iproute2, unprivileged user namespaces (on Ubuntu 24.04 and
+//! later, `sysctl kernel.apparmor_restrict_unprivileged_userns=0`), and the
+//! dummy driver loaded beforehand with `modprobe dummy numdummies=0`, since
+//! modules do not load from inside a user namespace.
+//!
 //! Each test gives the relay its own dummy interface as the uplink and binds
-//! the relay's destination socket to it. The fake streamer and the receiver
-//! stay on loopback, which keeps working throughout.
+//! the relay's destination socket to its address. The fake streamer and the
+//! receiver stay on loopback. The tests check that tagged probes do not reach
+//! the receiver while the uplink address is gone, that the relay keeps
+//! running, and that traffic flows again within a bound after it returns.
 
 mod common;
 
@@ -31,33 +38,83 @@ fn ip(args: &[&str]) {
     );
 }
 
-/// Refuses to touch anything unless this is a private namespace: the opt-in
-/// variable is set and the only interfaces are loopback and our own.
+/// Refuses to touch anything unless this runs in a user namespace other than
+/// the initial one. There, CAP_NET_ADMIN only covers network namespaces that
+/// namespace owns, so even a mistake cannot change the host's network: the
+/// kernel would refuse with EPERM. Run as real root, or in a user namespace
+/// without its own network namespace, the tests fail instead. Any lookup
+/// error also fails the test.
 fn require_private_netns() {
     assert_eq!(
         std::env::var("MOBLINK_TEST_NETNS").as_deref(),
         Ok("1"),
-        "set MOBLINK_TEST_NETNS=1 and run inside a private network namespace"
+        "set MOBLINK_TEST_NETNS=1 and run under unshare, see the file header"
+    );
+    let uid_map = std::fs::read_to_string("/proc/self/uid_map").expect("read /proc/self/uid_map");
+    // The initial user namespace maps every id onto itself.
+    let fields: Vec<&str> = uid_map.split_whitespace().collect();
+    assert!(
+        !fields.is_empty() && fields != ["0", "0", "4294967295"],
+        "running in the initial user namespace; use unshare --map-root-user --net"
     );
     let output = Command::new("ip")
         .args(["-o", "link", "show"])
         .output()
         .expect("run ip(8)");
+    assert!(output.status.success(), "ip -o link show failed");
     let links = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        links.lines().any(|line| line.contains(": lo:")),
+        "no loopback interface listed"
+    );
     for line in links.lines() {
         let name = line.split(':').nth(1).unwrap_or("").trim();
         let name = name.split('@').next().unwrap_or(name);
         assert!(
             name == "lo" || name.starts_with("mlt"),
-            "interface {name} present: not a private network namespace"
+            "interface {name} present: not a fresh network namespace"
         );
     }
 }
 
-fn add_uplink(name: &str, address: &str) {
-    ip(&["link", "add", name, "type", "dummy"]);
-    ip(&["addr", "add", &format!("{address}/32"), "dev", name]);
-    ip(&["link", "set", name, "up"]);
+/// A dummy interface standing in for the relay's uplink. Deleted on drop, so
+/// a failing test leaves nothing behind for the others.
+struct Uplink {
+    name: &'static str,
+    address: &'static str,
+}
+
+impl Uplink {
+    fn add(name: &'static str, address: &'static str) -> Self {
+        let uplink = Self { name, address };
+        uplink.plug();
+        uplink
+    }
+
+    fn plug(&self) {
+        ip(&["link", "add", self.name, "type", "dummy"]);
+        ip(&[
+            "addr",
+            "add",
+            &format!("{}/32", self.address),
+            "dev",
+            self.name,
+        ]);
+        ip(&["link", "set", self.name, "up"]);
+    }
+
+    fn unplug(&self) {
+        ip(&["link", "del", self.name]);
+    }
+}
+
+impl Drop for Uplink {
+    fn drop(&mut self) {
+        Command::new("ip")
+            .args(["link", "del", self.name])
+            .output()
+            .ok();
+    }
 }
 
 /// Waits until a session carries traffic to `receiver` again: the existing
@@ -99,9 +156,8 @@ async fn wait_for_working_tunnel(
 #[ignore = "needs a private network namespace, see the file header"]
 async fn uplink_address_lost_and_restored() {
     require_private_netns();
-    let uplink = "mlt1";
-    let address = "192.0.2.1";
-    add_uplink(uplink, address);
+    let uplink = Uplink::add("mlt1", "192.0.2.1");
+    let address = uplink.address;
 
     let mut moblin = FakeMoblin::start().await;
     let receiver = EchoReceiver::bind("127.0.0.1:0").await;
@@ -111,14 +167,14 @@ async fn uplink_address_lost_and_restored() {
     let port = session.start_tunnel(receiver.addr).await;
     assert!(udp.round_trip(port, b"before address loss").await);
 
-    ip(&["addr", "del", &format!("{address}/32"), "dev", uplink]);
+    ip(&["addr", "del", &format!("{address}/32"), "dev", uplink.name]);
     assert!(!udp.round_trip(port, b"while the address is gone").await);
     sleep(Duration::from_secs(6)).await;
     assert!(!udp.round_trip(port, b"still gone").await);
     assert!(!receiver.has_received(b"while the address is gone"));
     assert!(!receiver.has_received(b"still gone"));
 
-    ip(&["addr", "add", &format!("{address}/32"), "dev", uplink]);
+    ip(&["addr", "add", &format!("{address}/32"), "dev", uplink.name]);
     let recovery = wait_for_working_tunnel(
         Some((session, port)),
         &mut moblin,
@@ -129,7 +185,6 @@ async fn uplink_address_lost_and_restored() {
     .await;
     eprintln!("address restored, traffic again after {recovery:?}");
     assert!(relay.is_running());
-    ip(&["link", "del", uplink]);
 }
 
 /// The uplink interface disappears and comes back with the same address, as
@@ -139,9 +194,8 @@ async fn uplink_address_lost_and_restored() {
 #[ignore = "needs a private network namespace, see the file header"]
 async fn uplink_interface_removed_and_replugged() {
     require_private_netns();
-    let uplink = "mlt2";
-    let address = "192.0.2.2";
-    add_uplink(uplink, address);
+    let uplink = Uplink::add("mlt2", "192.0.2.2");
+    let address = uplink.address;
 
     let mut moblin = FakeMoblin::start().await;
     let receiver = EchoReceiver::bind("127.0.0.1:0").await;
@@ -151,13 +205,15 @@ async fn uplink_interface_removed_and_replugged() {
     let port = session.start_tunnel(receiver.addr).await;
     assert!(udp.round_trip(port, b"before unplug").await);
 
-    ip(&["link", "del", uplink]);
+    uplink.unplug();
     assert!(!udp.round_trip(port, b"while unplugged").await);
     sleep(Duration::from_secs(6)).await;
+    assert!(!udp.round_trip(port, b"still unplugged").await);
     assert!(!receiver.has_received(b"while unplugged"));
+    assert!(!receiver.has_received(b"still unplugged"));
     assert!(relay.is_running(), "relay exited when its uplink vanished");
 
-    add_uplink(uplink, address);
+    uplink.plug();
     let recovery = wait_for_working_tunnel(
         Some((session, port)),
         &mut moblin,
@@ -168,5 +224,4 @@ async fn uplink_interface_removed_and_replugged() {
     .await;
     eprintln!("interface replugged, traffic again after {recovery:?}");
     assert!(relay.is_running());
-    ip(&["link", "del", uplink]);
 }
