@@ -76,7 +76,7 @@ async fn relay_process_loss_and_restart() {
     relay.kill();
     let ended = session.wait_ended(Duration::from_secs(2)).await;
     assert_ne!(ended.how, EndedBy::Dropped);
-    udp.assert_quiet(port, b"sent after relay loss", &receiver, RETIRED_WINDOW)
+    udp.assert_quiet(port, b"sent after relay loss", &[&receiver], RETIRED_WINDOW)
         .await;
 
     let mut relay = RelayProcess::spawn("relay-loss", id, moblin.addr, "127.0.0.1");
@@ -114,7 +114,7 @@ async fn reconnect_after_streamer_drop(graceful: bool) {
     };
     // Give the relay a moment to notice, then the old tunnel must be gone.
     sleep(Duration::from_millis(200)).await;
-    udp.assert_quiet(port, b"old tunnel after drop", &receiver, RETIRED_WINDOW)
+    udp.assert_quiet(port, b"old tunnel after drop", &[&receiver], RETIRED_WINDOW)
         .await;
 
     let mut session2 = moblin.next_session(Duration::from_secs(10)).await;
@@ -125,7 +125,7 @@ async fn reconnect_after_streamer_drop(graceful: bool) {
     let port2 = session2.start_tunnel(receiver.addr).await;
     assert!(udp.round_trip(port2, b"after reconnect").await);
     if port2 != port {
-        udp.assert_quiet(port, b"old tunnel later", &receiver, RETIRED_WINDOW)
+        udp.assert_quiet(port, b"old tunnel later", &[&receiver], RETIRED_WINDOW)
             .await;
     }
     assert_eq!(moblin.accepted(), accepted + 1, "more than one reconnect");
@@ -161,21 +161,33 @@ async fn destination_port_change_moves_the_tunnel() {
     assert!(!first.has_received(b"to the new port"));
 
     if port2 != port1 {
-        udp.assert_quiet(port1, b"late on the old port", &first, RETIRED_WINDOW)
-            .await;
-        assert!(!second.has_received(b"late on the old port #1"));
+        udp.assert_quiet(
+            port1,
+            b"late on the old port",
+            &[&first, &second],
+            RETIRED_WINDOW,
+        )
+        .await;
     }
 
-    // Replace it several more times on one connection; only the newest works.
+    // Replace it several more times on one connection, alternating between
+    // the receivers; only the newest tunnel works.
     let mut previous = port2;
-    for i in 0..5 {
-        let port = session.start_tunnel(first.addr).await;
+    for i in 0..6 {
+        let target = if i % 2 == 0 { &first } else { &second };
+        let port = session.start_tunnel(target.addr).await;
         let payload = format!("replacement {i}");
         assert!(udp.round_trip(port, payload.as_bytes()).await);
+        assert!(target.has_received(payload.as_bytes()));
         if port != previous {
             let stale = format!("stale {i}");
-            udp.assert_quiet(previous, stale.as_bytes(), &first, RETIRED_WINDOW)
-                .await;
+            udp.assert_quiet(
+                previous,
+                stale.as_bytes(),
+                &[&first, &second],
+                RETIRED_WINDOW,
+            )
+            .await;
         }
         previous = port;
     }
@@ -212,6 +224,9 @@ async fn silent_streamer_mid_stream_is_detected_and_rejoined() {
         connected_relay("silent-streamer").await;
     let id = session.relay_id;
     stream_for(&udp, port, Duration::from_secs(10)).await;
+    // A fresh control exchange right before the silence, so a hang-up by the
+    // 45 s heartbeat alone would land after the 25 to 40 s window.
+    assert!(session.status().await["response"]["result"]["ok"].is_object());
 
     session.go_silent().await;
     let silent_at = Instant::now();
@@ -221,8 +236,13 @@ async fn silent_streamer_mid_stream_is_detected_and_rejoined() {
 
     let mut session2 = moblin.next_session(Duration::from_secs(9)).await;
     assert_eq!(session2.relay_id, id);
-    udp.assert_quiet(port, b"old tunnel after silence", &receiver, RETIRED_WINDOW)
-        .await;
+    udp.assert_quiet(
+        port,
+        b"old tunnel after silence",
+        &[&receiver],
+        RETIRED_WINDOW,
+    )
+    .await;
     let port2 = session2.start_tunnel(receiver.addr).await;
     assert!(udp.round_trip(port2, b"after silence").await);
     assert!(relay.is_running());
@@ -236,7 +256,10 @@ async fn silent_streamer_without_tunnel_is_dropped_by_heartbeat() {
     let id = Uuid::new_v4();
     let mut relay = RelayProcess::spawn("heartbeat", id, moblin.addr, "127.0.0.1");
     let mut session = moblin.next_session(FIRST_SESSION).await;
-    // The status request is the last frame the relay gets from this session.
+    // Stay responsive (pongs) for a while first, so a timer counted from the
+    // connection would end too early. The status request is then the last
+    // frame the relay gets from this session.
+    sleep(Duration::from_secs(10)).await;
     assert!(session.status().await["response"]["result"]["ok"].is_object());
     let last_frame = Instant::now();
     session.go_silent().await;
