@@ -21,8 +21,6 @@ const STOCK: &str = include_str!("../../install/belabox/systemd/moblink-relay-se
 
 pub struct Unit {
     name: String,
-    path: PathBuf,
-    dropin: PathBuf,
     state: PathBuf,
 }
 
@@ -50,22 +48,19 @@ impl Unit {
         let dropin = runtime.join(format!("{name}.d"));
         let state = std::env::temp_dir().join(&name);
         fs::create_dir(&state).expect("create test state directory");
-        let unit = Self {
-            name,
-            path,
-            dropin,
-            state,
-        };
+        // The launcher owns teardown so that a panic and a killed harness
+        // use the same stop confirmation and runtime-file cleanup.
+        let unit = Self { name, state };
         unit.set_owner(NO_OWNER);
         unit.set_ready(true);
 
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&unit.path)
+            .open(&path)
             .expect("create runtime test unit");
         writeln!(file, "{STOCK}").unwrap();
-        fs::create_dir(&unit.dropin).expect("create test drop-in directory");
+        fs::create_dir(&dropin).expect("create test drop-in directory");
         let state = unit_quote(&unit.state);
         let owner = unit_quote(&unit.state.join("owner"));
         let ready = unit_quote(&unit.state.join("ready"));
@@ -77,7 +72,7 @@ impl Unit {
             .map(|addr| format!(" --streamer-url ws://{addr}"))
             .unwrap_or_default();
         fs::write(
-            unit.dropin.join("box.conf"),
+            dropin.join("box.conf"),
             format!(
                 include_str!("../fixtures/box.conf"),
                 state = state,
@@ -127,34 +122,25 @@ impl Unit {
         assert_ok(ctl(&[verb, &self.name]));
     }
 
-    pub fn assert_start_rejected(&self) {
+    pub async fn assert_start_rejected(&self) {
         let output = ctl(&["start", &self.name]);
         assert!(
             !output.status.success(),
             "rate-limited unit accepted a start: {output:?}"
         );
-        assert!(
+        self.wait_for("systemd start-rate rejection in journal or result", || {
             self.property("Result") == "start-limit-hit"
                 || self
                     .journal()
                     .iter()
-                    .filter(|entry| {
-                        entry["MESSAGE"].as_str().is_some_and(|message| {
-                            message.contains("Start request repeated too quickly")
-                        })
-                    })
+                    .filter(|entry| start_limited(entry))
                     .count()
-                    >= 2,
-            "systemd did not report start-rate limiting"
-        );
+                    >= 2
+        })
+        .await;
     }
 
     fn journal(&self) -> Vec<Value> {
-        let output = Command::new("journalctl")
-            .args(["--no-pager", "--sync"])
-            .output()
-            .expect("sync system journal");
-        assert_ok(output);
         let output = Command::new("journalctl")
             .args(["--no-pager", "--output=json", "--unit", &self.name])
             .output()
@@ -167,35 +153,77 @@ impl Unit {
             .collect()
     }
 
-    pub fn assert_backoff_journal(&self) {
+    pub async fn assert_backoff_journal(&self) {
+        self.wait_for("start-limited attempt in journal", || {
+            self.journal().iter().any(start_limited)
+        })
+        .await;
         let journal = self.journal();
+        assert_eq!(
+            journal
+                .iter()
+                .filter(|entry| entry["MESSAGE"] == "fixture-pre-start-failed")
+                .count(),
+            2
+        );
         let events: Vec<_> = journal
             .iter()
             .filter_map(|entry| {
                 let message = entry["MESSAGE"].as_str()?;
                 let time: u64 = entry["__MONOTONIC_TIMESTAMP"].as_str()?.parse().unwrap();
-                let phase = if message.contains("restart counter is at 2.") {
-                    "first retry"
-                } else if message == "fixture-pre-start-failed" {
-                    "failure"
-                } else if message.contains("Start request repeated too quickly") {
-                    "limit"
-                } else {
-                    return None;
+                let phase = match entry["N_RESTARTS"].as_str() {
+                    Some("1") => "retry 1",
+                    Some("2") => "retry 2",
+                    Some("3") => "retry 3",
+                    Some("4") => "retry 4",
+                    Some(other) => panic!("unexpected restart counter {other}"),
+                    None if message.contains("Main process exited")
+                        && entry["EXIT_STATUS"] == "9" =>
+                    {
+                        "crash"
+                    }
+                    None if message.contains("Control process exited")
+                        && entry["EXIT_STATUS"] == "1" =>
+                    {
+                        "pre-start exit"
+                    }
+                    None if start_limited(entry) => "limit",
+                    None => return None,
                 };
                 Some((phase, time))
             })
             .collect();
         assert_eq!(
             events.iter().map(|(phase, _)| *phase).collect::<Vec<_>>(),
-            ["first retry", "failure", "failure", "limit"],
+            [
+                "crash",
+                "retry 1",
+                "crash",
+                "retry 2",
+                "pre-start exit",
+                "retry 3",
+                "pre-start exit",
+                "retry 4",
+                "limit"
+            ],
             "{events:?}"
         );
-        for pair in events[1..].windows(2) {
+        // RestartSec=1s, RestartSteps=2 and RestartMaxDelaySec=3s
+        // give 1, sqrt(3), 3 and 3 seconds. Use manager-to-manager
+        // timestamps to exclude the start job and pre-start process time.
+        // Leave room for timer coalescing and journal ingestion, while
+        // keeping the first and intermediate retry windows disjoint.
+        for (pair, (min_ms, max_ms)) in
+            events
+                .chunks_exact(2)
+                .zip([(950, 1400), (1650, 2100), (2900, 3400), (2900, 3400)])
+        {
             let gap = Duration::from_micros(pair[1].1 - pair[0].1);
             assert!(
-                (Duration::from_millis(2800)..=Duration::from_secs(5)).contains(&gap),
-                "expected capped 3s backoff, got {gap:?}: {events:?}"
+                (Duration::from_millis(min_ms)..=Duration::from_millis(max_ms)).contains(&gap),
+                "{} after {} outside {min_ms}–{max_ms} ms: {gap:?}",
+                pair[1].0,
+                pair[0].0,
             );
         }
     }
@@ -237,26 +265,10 @@ impl Unit {
     }
 }
 
-impl Drop for Unit {
-    fn drop(&mut self) {
-        let stopped = ctl(&["stop", &self.name]);
-        if !stopped.status.success() {
-            eprintln!("could not stop {}: {stopped:?}", self.name);
-        }
-        if std::thread::panicking() {
-            if let Ok(log) = Command::new("journalctl")
-                .args(["--no-pager", "-n", "120", "-u", &self.name])
-                .output()
-            {
-                eprintln!("{}", String::from_utf8_lossy(&log.stdout));
-            }
-        }
-        let _ = ctl(&["reset-failed", &self.name]);
-        let _ = fs::remove_dir_all(&self.dropin);
-        let _ = fs::remove_file(&self.path);
-        let _ = ctl(&["daemon-reload"]);
-        let _ = fs::remove_dir_all(&self.state);
-    }
+fn start_limited(entry: &Value) -> bool {
+    entry["MESSAGE"]
+        .as_str()
+        .is_some_and(|message| message.contains("Start request repeated too quickly"))
 }
 
 fn ctl(args: &[&str]) -> Output {

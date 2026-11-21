@@ -80,6 +80,19 @@ impl Link {
         peer.enter(|| self.netem_on(self.peer, impairment));
     }
 
+    pub fn netem_drops(self, peer: &Peer) -> (u64, u64) {
+        let drops = |device| {
+            let statistics = tc(&["-s", "-j", "qdisc", "show", "dev", device]);
+            let qdiscs: Vec<serde_json::Value> = serde_json::from_slice(&statistics).unwrap();
+            qdiscs
+                .iter()
+                .find(|qdisc| qdisc["kind"] == "netem" && qdisc["root"] == true)
+                .and_then(|qdisc| qdisc["drops"].as_u64())
+                .expect("root netem drop counter")
+        };
+        (drops(self.relay), peer.enter(|| drops(self.peer)))
+    }
+
     fn netem_on(self, device: &str, impairment: &[&str]) {
         let mut args = vec!["qdisc", "replace", "dev", device, "root", "netem"];
         if impairment.is_empty() {
@@ -91,9 +104,10 @@ impl Link {
     }
 }
 
-fn tc(args: &[&str]) {
+fn tc(args: &[&str]) -> Vec<u8> {
     let output = Command::new("tc").args(args).output().expect("run tc");
     assert!(output.status.success(), "tc {args:?}: {output:?}");
+    output.stdout
 }
 
 pub struct Peer {
