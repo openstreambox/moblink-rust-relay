@@ -1,0 +1,36 @@
+[package]
+name = "moblink-rust-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+arbitrary = { version = "1", features = ["derive"] }
+base64 = "0.22.1"
+libfuzzer-sys = "0.4"
+moblink-rust = { path = ".." }
+serde = { version = "1.0.217", features = ["derive"] }
+serde_json = "1.0.135"
+sha2 = "0.11.0"
+tokio = { version = "1.43.0", features = ["rt", "fs", "process", "time", "io-util"] }
+uuid = { version = "1.11", features = ["v4", "serde"] }
+
+# Keep the fuzz package out of any parent workspace.
+[workspace]
+
+[[bin]]
+name = "messages"
+path = "fuzz_targets/messages.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "status_file"
+path = "fuzz_targets/status_file.rs"
+test = false
+doc = false
+bench = false
