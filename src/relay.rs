@@ -981,6 +981,18 @@ async fn read_status_bytes(reader: impl AsyncRead + Unpin) -> Option<Vec<u8>> {
     Some(contents)
 }
 
+/// A battery percentage outside 0 to 100 is not a reading, so it is dropped
+/// rather than forwarded to the streamer.
+fn status_in_range(mut status: Status) -> Status {
+    if let Some(percentage) = status.battery_percentage
+        && !(0..=100).contains(&percentage)
+    {
+        error!("Ignoring battery percentage {percentage}, expected 0 to 100");
+        status.battery_percentage = None;
+    }
+    status
+}
+
 pub fn create_get_status_closure(
     status_executable: &Option<String>,
     status_file: &Option<String>,
@@ -1028,7 +1040,7 @@ pub fn create_get_status_closure(
             };
             let output = String::from_utf8(output).unwrap_or_default();
             match serde_json::from_str(&output) {
-                Ok(status) => status,
+                Ok(status) => status_in_range(status),
                 Err(e) => {
                     error!("Failed to decode status with error: {e}");
                     Default::default()
