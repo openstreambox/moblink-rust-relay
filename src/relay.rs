@@ -1,6 +1,7 @@
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
+use std::process::Stdio;
 use std::str::FromStr;
 use std::sync::{Arc, Weak};
 
@@ -9,7 +10,7 @@ use futures_util::{SinkExt, StreamExt};
 use log::{debug, error, info};
 use serde::{Deserialize, Serialize};
 use tokio::fs::File;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::process::Command;
 use tokio::sync::{Mutex, Notify, watch};
@@ -959,6 +960,27 @@ fn parse_socket_addr(addr_str: &str) -> Result<SocketAddr, std::io::Error> {
     ))
 }
 
+/// Largest status document the relay will read, from a file or from an
+/// executable. A real status is a line of JSON; the cap keeps a runaway script
+/// or the wrong file from filling memory on a small device.
+const MAX_STATUS_BYTES: u64 = 64 * 1024;
+
+/// Read at most `MAX_STATUS_BYTES` from `reader`. `None` when the source holds
+/// more than that or cannot be read.
+async fn read_status_bytes(reader: impl AsyncRead + Unpin) -> Option<Vec<u8>> {
+    let mut contents = vec![];
+    reader
+        .take(MAX_STATUS_BYTES + 1)
+        .read_to_end(&mut contents)
+        .await
+        .ok()?;
+    if contents.len() as u64 > MAX_STATUS_BYTES {
+        error!("Status is larger than {MAX_STATUS_BYTES} bytes, ignoring it");
+        return None;
+    }
+    Some(contents)
+}
+
 pub fn create_get_status_closure(
     status_executable: &Option<String>,
     status_file: &Option<String>,
@@ -971,20 +993,35 @@ pub fn create_get_status_closure(
         Box::pin(async move {
             let output = if let Some(status_executable) = &status_executable {
                 let mut command = Command::new(status_executable);
-                command.kill_on_drop(true);
+                command
+                    .kill_on_drop(true)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null());
+                let Ok(mut child) = command.spawn() else {
+                    return Default::default();
+                };
+                let Some(stdout) = child.stdout.take() else {
+                    return Default::default();
+                };
                 // Leave time for the status reply within the frame budget.
-                let Ok(Ok(output)) = timeout(Duration::from_secs(3), command.output()).await else {
+                let Ok(Some(output)) = timeout(Duration::from_secs(3), async {
+                    let output = read_status_bytes(stdout).await?;
+                    child.wait().await.ok()?;
+                    Some(output)
+                })
+                .await
+                else {
                     return Default::default();
                 };
-                output.stdout
+                output
             } else if let Some(status_file) = &status_file {
-                let Ok(mut file) = File::open(status_file).await else {
+                let Ok(file) = File::open(status_file).await else {
                     return Default::default();
                 };
-                let mut contents = vec![];
-                if file.read_to_end(&mut contents).await.is_err() {
+                let Some(contents) = read_status_bytes(file).await else {
                     return Default::default();
-                }
+                };
                 contents
             } else {
                 return Default::default();
