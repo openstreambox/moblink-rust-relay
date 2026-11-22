@@ -82,6 +82,9 @@ If `--status-executable` takes longer than three seconds, the relay reports
 empty status and keeps forwarding. The timeout kills only the direct child
 process. Any subprocesses it launched can continue running.
 
+A status larger than 64 KiB, from either source, is ignored the same way and the
+executable is stopped as soon as it passes that size.
+
 ### Run Relay Service
 
 `moblink-relay` connects a single network interface. `moblink-relay-service` is a supervisor that watches every eligible network interface and starts one relay per interface automatically. It is useful on machines with several uplinks (for example a router with Ethernet, Wi-Fi, and cellular), where each uplink becomes an independent bonding path.
