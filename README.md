@@ -51,6 +51,19 @@ rustup override set nightly
 cargo build --release
 ```
 
+### Test
+
+```bash
+# Unit tests and the loopback failure tests (about a minute)
+cargo test
+
+# Run the failure tests against another relay binary, for example a release build
+MOBLINK_RELAY_BIN=/path/to/moblink-relay cargo test --test failure_recovery
+```
+
+The uplink tests in `tests/netns_failures.rs` add and remove interfaces, so
+they only run inside a private network namespace. The file header shows how.
+
 ### Run Relay
 
 ```bash
